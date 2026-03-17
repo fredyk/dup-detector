@@ -294,22 +294,21 @@ func FindTreeDupsByHash(allFiles []ScannedFile, onProgress func(done, total int)
 
 	accum := make(map[string]*dirAccum, len(allFiles)/8)
 	total := len(allFiles)
-	const maxDepth = 8
 
 	for i, f := range allFiles {
 		if onProgress != nil && i%100000 == 0 {
 			onProgress(i, total)
 		}
 
-		// Walk up the directory tree using zero-allocation string slicing.
-		// current is always a slice of f.Path (or "/" which is a constant).
+		// Walk up the entire directory tree using zero-allocation string slicing.
+		// Each ancestor accumulates the file's contribution with its own relative path.
 		p := f.Path
 		current := p[:strings.LastIndexByte(p, '/')] // immediate parent, no alloc
 		if current == "" {
 			current = "/"
 		}
 
-		for depth := 0; depth < maxDepth; depth++ {
+		for {
 			dirLen := len(current)
 			dd := accum[current]
 			if dd == nil {
