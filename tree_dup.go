@@ -377,10 +377,48 @@ func FindTreeDupsByHash(allFiles []ScannedFile, onProgress func(done, total int)
 	}
 
 	pairs = removeSubPairsFast(pairs)
+
+	// Verify every surviving pair: the hash accumulation only walks up maxDepth
+	// ancestor levels, so files deeper than that are invisible to the hash.
+	// Cross-check all files in each pair to eliminate false positives.
+	verified := pairs[:0]
+	for _, p := range pairs {
+		if verifyTreePairMtime(p.DirA, p.DirB, allFiles) {
+			verified = append(verified, p)
+		}
+	}
+	pairs = verified
+
 	sort.Slice(pairs, func(i, j int) bool {
 		return pairs[i].TotalSize > pairs[j].TotalSize
 	})
 	return pairs
+}
+
+// verifyTreePairMtime returns true iff dirA and dirB contain exactly the same
+// files (same relative paths, sizes, and mtimes). allFiles must be sorted by path.
+func verifyTreePairMtime(dirA, dirB string, allFiles []ScannedFile) bool {
+	filesA := filesUnderDir(dirA, allFiles)
+	filesB := filesUnderDir(dirB, allFiles)
+	if len(filesA) == 0 || len(filesA) != len(filesB) {
+		return false
+	}
+	prefixA := dirA + string(filepath.Separator)
+	prefixB := dirB + string(filepath.Separator)
+
+	type fileKey struct{ size, mtime int64 }
+	bMap := make(map[string]fileKey, len(filesB))
+	for _, f := range filesB {
+		bMap[f.Path[len(prefixB):]] = fileKey{f.Size, f.ModTime}
+	}
+	for _, f := range filesA {
+		rel := f.Path[len(prefixA):]
+		bk, ok := bMap[rel]
+		if !ok || bk.size != f.Size || bk.mtime != f.ModTime {
+			return false
+		}
+	}
+	return true
 }
 
 // hashTreeEntry computes a 64-bit FNV-1a hash of (relPath, size, mtime)
