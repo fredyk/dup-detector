@@ -107,37 +107,27 @@ func handleTreeDups(pairs []TreeDupPair, allFiles []ScannedFile, reader *bufio.R
 		for {
 			fmt.Fprint(os.Stderr, "  Delete [A], [B], [s]kip, [a]uto-delete-B, [q]uit, [?]help: ")
 			line, _ := reader.ReadString('\n')
-			line = strings.TrimSpace(strings.ToLower(line))
+			line = strings.TrimSpace(line) // preserve case: A ≠ a
 
 			switch line {
 			case "?":
 				printTreeHelp()
-			case "", "s":
+			case "", "s", "S":
 				break prompt
-			case "q":
+			case "q", "Q":
 				return nil
+			case "A":
+				confirmAndDeleteTree("A", t.DirA, allFiles, reader, deleted, cfg)
+				break prompt
+			case "B", "b":
+				confirmAndDeleteTree("B", t.DirB, allFiles, reader, deleted, cfg)
+				break prompt
 			case "a":
 				autoMode = true
 				deleteTree(t.DirB, allFiles, deleted, cfg)
 				break prompt
-			case "b":
-				confirmAndDeleteTree("B", t.DirB, allFiles, reader, deleted, cfg)
-				break prompt
-			case "a_dir": // won't match; kept for clarity
-				confirmAndDeleteTree("A", t.DirA, allFiles, reader, deleted, cfg)
-				break prompt
 			default:
-				// handle uppercase A/B typed by user
-				switch strings.ToUpper(line) {
-				case "A":
-					confirmAndDeleteTree("A", t.DirA, allFiles, reader, deleted, cfg)
-					break prompt
-				case "B":
-					confirmAndDeleteTree("B", t.DirB, allFiles, reader, deleted, cfg)
-					break prompt
-				default:
-					fmt.Fprintln(os.Stderr, "  Invalid input. Enter A, B, s, a, q, or ?")
-				}
+				fmt.Fprintln(os.Stderr, "  Invalid input. Enter A, B, s, a, q, or ?")
 			}
 		}
 	}
