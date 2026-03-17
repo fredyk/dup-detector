@@ -200,13 +200,21 @@ func run(_ *cobra.Command, args []string) error {
 		status("Found %d files\n", len(filesA))
 	}
 
+	// Merge and sort all files for tree dup analysis
+	allFiles := make([]ScannedFile, 0, len(filesA)+len(filesB))
+	allFiles = append(allFiles, filesA...)
+	allFiles = append(allFiles, filesB...)
+	SortFilesByPath(allFiles)
+
 	status("Detecting duplicates...\n")
 	groups, err := DetectDups(filesA, filesB, &cfg)
 	if err != nil {
 		return fmt.Errorf("detecting duplicates: %w", err)
 	}
 
-	if len(groups) == 0 {
+	treePairs := FindTreeDups(groups, allFiles)
+
+	if len(groups) == 0 && len(treePairs) == 0 {
 		status("No duplicates found.\n")
 		return nil
 	}
@@ -215,17 +223,29 @@ func run(_ *cobra.Command, args []string) error {
 	for _, g := range groups {
 		totalWasted += g.WastedBytes()
 	}
-	status("Found %d duplicate group(s), %s reclaimable\n\n",
-		len(groups), FormatSize(totalWasted))
+	for _, t := range treePairs {
+		// tree pair wasted = TotalSize (one whole copy can be deleted)
+		// but individual files are already counted in groups; avoid double-count in summary
+		_ = t
+	}
+	status("Found %d tree duplicate(s), %d file-level group(s), %s reclaimable\n\n",
+		len(treePairs), len(groups), FormatSize(totalWasted))
 
 	// Print results to stdout
-	if err := PrintGroups(groups, cfg.Format, os.Stdout); err != nil {
-		return err
+	if len(treePairs) > 0 {
+		if err := PrintTreeDups(treePairs, cfg.Format, os.Stdout); err != nil {
+			return err
+		}
+	}
+	if len(groups) > 0 {
+		if err := PrintGroups(groups, cfg.Format, os.Stdout); err != nil {
+			return err
+		}
 	}
 
 	// Interactive deletion
 	if !cfg.DryRun {
-		if err := InteractiveDelete(groups, &cfg); err != nil {
+		if err := InteractiveDelete(treePairs, groups, allFiles, &cfg); err != nil {
 			return err
 		}
 	}

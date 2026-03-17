@@ -8,6 +8,42 @@ import (
 	"strings"
 )
 
+// PrintTreeDups formats and writes tree-level duplicate pairs to w.
+func PrintTreeDups(pairs []TreeDupPair, format string, w io.Writer) error {
+	switch format {
+	case "json":
+		type jsonTree struct {
+			TotalSize int64    `json:"total_size"`
+			FileCount int      `json:"file_count"`
+			Dirs      []string `json:"dirs"`
+		}
+		out := make([]jsonTree, len(pairs))
+		for i, p := range pairs {
+			out[i] = jsonTree{TotalSize: p.TotalSize, FileCount: p.FileCount, Dirs: []string{p.DirA, p.DirB}}
+		}
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{"tree_duplicates": out})
+	case "csv":
+		cw := csv.NewWriter(w)
+		_ = cw.Write([]string{"type", "size_bytes", "size_human", "file_count", "dir_a", "dir_b"})
+		for _, p := range pairs {
+			_ = cw.Write([]string{"tree", fmt.Sprintf("%d", p.TotalSize), FormatSize(p.TotalSize),
+				fmt.Sprintf("%d", p.FileCount), p.DirA, p.DirB})
+		}
+		cw.Flush()
+		return cw.Error()
+	default: // columns, simple
+		fmt.Fprintln(w, "# === Tree duplicates ===")
+		for i, p := range pairs {
+			fmt.Fprintf(w, "# [T%d] %s  (%d files)\n", i+1, FormatSize(p.TotalSize), p.FileCount)
+			fmt.Fprintf(w, "  %s\n  %s\n", p.DirA, p.DirB)
+		}
+		fmt.Fprintln(w)
+		return nil
+	}
+}
+
 // PrintGroups formats and writes duplicate groups to w.
 func PrintGroups(groups []DupGroup, format string, w io.Writer) error {
 	switch format {
