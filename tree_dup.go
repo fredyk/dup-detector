@@ -348,14 +348,15 @@ func FindTreeDupsByHash(allFiles []ScannedFile, onProgress func(done, total int)
 		byKey[k] = append(byKey[k], dir)
 	}
 
-	// maxDirsPerBucket: skip buckets with too many matching dirs.
-	// These are usually ubiquitous single-file dirs (copyright, README…)
-	// that would generate millions of false-positive pairs.
-	const maxDirsPerBucket = 30
+	// maxDirsPerBucket: cap to avoid O(n²) pair explosion from ubiquitous dirs.
+	// Single-file dirs (LICENSE, README…) can appear in thousands of places;
+	// we skip those via minFileCount regardless of bucket size.
+	const maxDirsPerBucket = 2000
+	const minFileCount = 2 // ignore single-file dirs — not meaningful tree dups
 
 	var pairs []TreeDupPair
-	for _, dirs := range byKey {
-		if len(dirs) < 2 || len(dirs) > maxDirsPerBucket {
+	for k, dirs := range byKey {
+		if k.fileCount < minFileCount || len(dirs) < 2 || len(dirs) > maxDirsPerBucket {
 			continue
 		}
 		sort.Strings(dirs)
