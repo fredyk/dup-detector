@@ -54,15 +54,10 @@ func FormatSize(bytes int64) string {
 }
 
 // IsSubdir returns true if child is inside parent (not equal).
+// Assumes both paths are absolute and clean (no /../ components).
 func IsSubdir(parent, child string) bool {
-	parent = filepath.Clean(parent)
-	child = filepath.Clean(child)
-	if parent == child {
+	if len(child) <= len(parent) {
 		return false
 	}
-	rel, err := filepath.Rel(parent, child)
-	if err != nil {
-		return false
-	}
-	return !strings.HasPrefix(rel, "..")
+	return strings.HasPrefix(child, parent) && child[len(parent)] == filepath.Separator
 }

@@ -27,6 +27,9 @@ type Config struct {
 	// Output
 	Format string
 
+	// Performance
+	Workers int
+
 	// Parsed values
 	MinSize int64
 	MaxSize int64
@@ -90,6 +93,8 @@ func init() {
 		"skip files larger than SIZE")
 	f.StringVar(&cfg.Format, "format", "columns",
 		"output format: columns, json, csv, simple")
+	f.IntVar(&cfg.Workers, "workers", 0,
+		"parallel MD5 workers (default: number of CPUs)")
 }
 
 func main() {
@@ -206,46 +211,113 @@ func run(_ *cobra.Command, args []string) error {
 	allFiles = append(allFiles, filesB...)
 	SortFilesByPath(allFiles)
 
-	status("Detecting duplicates...\n")
-	groups, err := DetectDups(filesA, filesB, &cfg)
-	if err != nil {
-		return fmt.Errorf("detecting duplicates: %w", err)
+	// ── Phase 1: fast tree detection via directory hashing ───────────────────
+	status("Detecting duplicates (fast pass)...\n")
+	mtimeGroups := MtimeDups(filesA, filesB)
+
+	treeState := NewTreeDupState()
+	treeState.Workers = cfg.Workers
+	var allGroups []DupGroup
+
+	var hashProgressFn func(done, total int)
+	if cfg.Progress {
+		hashProgressFn = func(done, total int) {
+			fmt.Fprintf(os.Stderr, "\r  hashing dirs: %d / %d files  ", done, total)
+		}
+	}
+	earlyTrees := FindTreeDupsByHash(allFiles, hashProgressFn)
+	if cfg.Progress {
+		fmt.Fprintln(os.Stderr)
 	}
 
-	treePairs := FindTreeDups(groups, allFiles)
+	// Register early trees so MD5 pass doesn't re-report them
+	treeState.Confirmed = append(treeState.Confirmed, earlyTrees...)
 
-	if len(groups) == 0 && len(treePairs) == 0 {
+	if !cfg.DryRun && len(earlyTrees) > 0 {
+		deleted := OfferTreeDeletions(earlyTrees, allFiles, &cfg)
+		for p := range deleted {
+			treeState.MarkDeleted(p)
+		}
+	}
+	treeState.MarkHandled()
+
+	// ── Phase 2: MD5 streaming (only if -c flag set) ─────────────────────────
+	if cfg.Checksum {
+		status("Detecting duplicates (MD5 pass, largest first)...\n")
+
+		// Skip files already deleted in phase 1
+		skip := treeState.DeletedPaths()
+
+		err = ChecksumDups(filesA, filesB, twoDir, skip, cfg.Workers,
+			func(done, total int64) {
+				if cfg.Progress {
+					pct := int(100 * done / (total + 1))
+					fmt.Fprintf(os.Stderr, "\r  MD5: %d%%  (%s / %s)  ",
+						pct, FormatSize(done), FormatSize(total))
+				}
+			},
+			func(newGroups []DupGroup) bool {
+				allGroups = append(allGroups, newGroups...)
+				if cfg.DryRun {
+					return true
+				}
+				// Check for new confirmed tree dups from this MD5 batch
+				newTrees := treeState.AddGroups(newGroups, allFiles, true)
+				if len(newTrees) > 0 {
+					if cfg.Progress {
+						fmt.Fprintln(os.Stderr)
+					}
+					deleted := OfferTreeDeletions(newTrees, allFiles, &cfg)
+					for p := range deleted {
+						treeState.MarkDeleted(p)
+						skip[p] = true
+					}
+					treeState.MarkHandled()
+				}
+				return true
+			},
+		)
+		if cfg.Progress {
+			fmt.Fprintln(os.Stderr)
+		}
+		if err != nil {
+			return fmt.Errorf("detecting duplicates: %w", err)
+		}
+	} else {
+		allGroups = mtimeGroups
+	}
+
+	// ── Summary and output ────────────────────────────────────────────────────
+	finalTrees := treeState.Confirmed
+
+	if len(allGroups) == 0 && len(finalTrees) == 0 {
 		status("No duplicates found.\n")
 		return nil
 	}
 
 	var totalWasted int64
-	for _, g := range groups {
+	for _, g := range allGroups {
 		totalWasted += g.WastedBytes()
 	}
-	for _, t := range treePairs {
-		// tree pair wasted = TotalSize (one whole copy can be deleted)
-		// but individual files are already counted in groups; avoid double-count in summary
-		_ = t
-	}
 	status("Found %d tree duplicate(s), %d file-level group(s), %s reclaimable\n\n",
-		len(treePairs), len(groups), FormatSize(totalWasted))
+		len(finalTrees), len(allGroups), FormatSize(totalWasted))
 
 	// Print results to stdout
-	if len(treePairs) > 0 {
-		if err := PrintTreeDups(treePairs, cfg.Format, os.Stdout); err != nil {
+	if len(finalTrees) > 0 {
+		if err := PrintTreeDups(finalTrees, cfg.Format, os.Stdout); err != nil {
 			return err
 		}
 	}
-	if len(groups) > 0 {
-		if err := PrintGroups(groups, cfg.Format, os.Stdout); err != nil {
+	if len(allGroups) > 0 {
+		if err := PrintGroups(allGroups, cfg.Format, os.Stdout); err != nil {
 			return err
 		}
 	}
 
-	// Interactive deletion
+	// Interactive deletion: any remaining unhandled trees + file-level dups
 	if !cfg.DryRun {
-		if err := InteractiveDelete(treePairs, groups, allFiles, &cfg); err != nil {
+		unhandledTrees := treeState.UnhandledTrees()
+		if err := InteractiveDelete(unhandledTrees, allGroups, allFiles, &cfg); err != nil {
 			return err
 		}
 	}

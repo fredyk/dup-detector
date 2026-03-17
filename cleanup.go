@@ -8,6 +8,27 @@ import (
 	"strings"
 )
 
+// OfferTreeDeletions interactively offers deletion of a batch of tree dup pairs
+// discovered during progressive scanning. Returns the set of deleted paths.
+func OfferTreeDeletions(pairs []TreeDupPair, allFiles []ScannedFile, cfg *Config) map[string]bool {
+	if len(pairs) == 0 {
+		return map[string]bool{}
+	}
+	deleted := make(map[string]bool)
+	reader := bufio.NewReader(os.Stdin)
+
+	var treeTotal int64
+	for _, t := range pairs {
+		treeTotal += t.TotalSize
+	}
+	fmt.Fprintf(os.Stderr,
+		"\n%d new tree duplicate(s) found (%s reclaimable each copy).\n",
+		len(pairs), FormatSize(treeTotal))
+
+	_ = handleTreeDups(pairs, allFiles, reader, deleted, cfg)
+	return deleted
+}
+
 // InteractiveDelete first offers bulk deletion of complete tree duplicates,
 // then handles remaining file-level duplicates (skipping any files already deleted).
 func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []ScannedFile, cfg *Config) error {
