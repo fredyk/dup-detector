@@ -233,11 +233,26 @@ func run(_ *cobra.Command, args []string) error {
 	// Register early trees so MD5 pass doesn't re-report them
 	treeState.Confirmed = append(treeState.Confirmed, earlyTrees...)
 
-	if !cfg.DryRun && len(earlyTrees) > 0 {
+	// Skip interactive tree phase if the largest individual file dup outweighs
+	// the largest tree dup — file-level deletions will give bigger gains first.
+	largestFileDup := int64(0)
+	if len(mtimeGroups) > 0 {
+		largestFileDup = mtimeGroups[0].Size
+	}
+	largestTree := int64(0)
+	if len(earlyTrees) > 0 {
+		largestTree = earlyTrees[0].TotalSize
+	}
+	skipTreePhase := largestTree < largestFileDup
+
+	if !cfg.DryRun && len(earlyTrees) > 0 && !skipTreePhase {
 		deleted := OfferTreeDeletions(earlyTrees, allFiles, &cfg)
 		for p := range deleted {
 			treeState.MarkDeleted(p)
 		}
+	} else if skipTreePhase && len(earlyTrees) > 0 {
+		status("Skipping tree phase: largest file dup (%s) > largest tree dup (%s)\n",
+			FormatSize(largestFileDup), FormatSize(largestTree))
 	}
 	treeState.MarkHandled()
 
