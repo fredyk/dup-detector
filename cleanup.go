@@ -93,6 +93,11 @@ func handleTreeDups(pairs []TreeDupPair, allFiles []ScannedFile, reader *bufio.R
 	autoMode := false
 
 	for i, t := range pairs {
+		// Skip pairs where a side has already been fully deleted in this session.
+		if dirFullyDeleted(t.DirA, allFiles, deleted) || dirFullyDeleted(t.DirB, allFiles, deleted) {
+			continue
+		}
+
 		if autoMode {
 			deleteTree(t.DirB, allFiles, deleted, cfg)
 			continue
@@ -339,4 +344,19 @@ func printFileHelp() {
     a        auto mode: keep [1], delete rest for this and all remaining groups
     q        quit
     ?        show this help`)
+}
+
+// dirFullyDeleted returns true if every file under dir (as recorded in allFiles)
+// has been deleted in this session. Used to skip pairs involving already-gone dirs.
+func dirFullyDeleted(dir string, allFiles []ScannedFile, deleted map[string]bool) bool {
+	files := filesUnderDir(dir, allFiles)
+	if len(files) == 0 {
+		return false
+	}
+	for _, f := range files {
+		if !deleted[f.Path] {
+			return false
+		}
+	}
+	return true
 }
