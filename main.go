@@ -237,40 +237,17 @@ func run(_ *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr)
 	}
 
-	// Register early trees so MD5 pass doesn't re-report them
+	// Register early trees. All tree dups (early + MD5-confirmed) are held
+	// and presented in the single interactive phase below, interleaved with
+	// file-level groups by reclaimable bytes — no upfront tree-vs-file
+	// heuristic, no streaming interruption during MD5.
 	treeState.Confirmed = append(treeState.Confirmed, earlyTrees...)
-
-	// Skip interactive tree phase if the largest individual file dup outweighs
-	// the largest tree dup — file-level deletions will give bigger gains first.
-	largestFileDup := int64(0)
-	if len(mtimeGroups) > 0 {
-		largestFileDup = mtimeGroups[0].Size
-	}
-	largestTree := int64(0)
-	if len(earlyTrees) > 0 {
-		largestTree = earlyTrees[0].TotalSize
-	}
-	skipTreePhase := largestTree < largestFileDup
-
-	if !cfg.DryRun && len(earlyTrees) > 0 && !skipTreePhase {
-		deleted := OfferTreeDeletions(earlyTrees, allFiles, &cfg)
-		for p := range deleted {
-			treeState.MarkDeleted(p)
-		}
-	} else if skipTreePhase && len(earlyTrees) > 0 {
-		status("Skipping tree phase: largest file dup (%s) > largest tree dup (%s)\n",
-			FormatSize(largestFileDup), FormatSize(largestTree))
-	}
-	treeState.MarkHandled()
 
 	// ── Phase 2: MD5 streaming (only if -c flag set) ─────────────────────────
 	if cfg.Checksum {
 		status("Detecting duplicates (MD5 pass, largest first)...\n")
 
-		// Skip files already deleted in phase 1
-		skip := treeState.DeletedPaths()
-
-		err = ChecksumDups(filesA, filesB, twoDir, skip, cfg.Workers,
+		err = ChecksumDups(filesA, filesB, twoDir, nil, cfg.Workers,
 			func(done, total int64) {
 				if cfg.Progress {
 					pct := int(100 * done / (total + 1))
@@ -280,22 +257,9 @@ func run(_ *cobra.Command, args []string) error {
 			},
 			func(newGroups []DupGroup) bool {
 				allGroups = append(allGroups, newGroups...)
-				if cfg.DryRun {
-					return true
-				}
-				// Check for new confirmed tree dups from this MD5 batch
-				newTrees := treeState.AddGroups(newGroups, allFiles, true)
-				if len(newTrees) > 0 {
-					if cfg.Progress {
-						fmt.Fprintln(os.Stderr)
-					}
-					deleted := OfferTreeDeletions(newTrees, allFiles, &cfg)
-					for p := range deleted {
-						treeState.MarkDeleted(p)
-						skip[p] = true
-					}
-					treeState.MarkHandled()
-				}
+				// Accumulate newly-confirmed tree dups silently; offering
+				// happens once at the end.
+				treeState.AddGroups(newGroups, allFiles, true)
 				return true
 			},
 		)

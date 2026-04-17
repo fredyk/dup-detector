@@ -10,84 +10,127 @@ import (
 	"strings"
 )
 
-// OfferTreeDeletions interactively offers deletion of a batch of tree dup pairs
-// discovered during progressive scanning. Returns the set of deleted paths.
-func OfferTreeDeletions(pairs []TreeDupPair, allFiles []ScannedFile, cfg *Config) map[string]bool {
-	if len(pairs) == 0 {
-		return map[string]bool{}
-	}
-	deleted := make(map[string]bool)
-	reader := bufio.NewReader(os.Stdin)
+// actionKind distinguishes tree-level from file-level deletions in the
+// unified interactive queue.
+type actionKind int
 
-	var treeTotal int64
-	for _, t := range pairs {
-		treeTotal += t.TotalSize
-	}
-	fmt.Fprintf(os.Stderr,
-		"\n%d new tree duplicate(s) found (%s reclaimable each copy).\n",
-		len(pairs), FormatSize(treeTotal))
+const (
+	actionTree actionKind = iota
+	actionFileGroup
+)
 
-	_ = handleTreeDups(pairs, allFiles, reader, deleted, cfg)
-	return deleted
+// cleanupAction is a single interactive unit: either a tree dup pair or a
+// file-level dup group. Actions are sorted by reclaimable bytes descending
+// and presented together with a uniform numeric prompt, so the user always
+// faces the biggest win next regardless of kind.
+type cleanupAction struct {
+	kind  actionKind
+	tree  TreeDupPair // valid when kind == actionTree
+	group DupGroup    // valid when kind == actionFileGroup
 }
 
-// InteractiveDelete first offers bulk deletion of complete tree duplicates,
-// then handles remaining file-level duplicates (skipping any files already deleted).
+func (a *cleanupAction) waste() int64 {
+	if a.kind == actionTree {
+		return a.tree.TotalSize
+	}
+	return a.group.WastedBytes()
+}
+
+func (a *cleanupAction) items() []string {
+	if a.kind == actionTree {
+		return []string{a.tree.DirA, a.tree.DirB}
+	}
+	paths := make([]string, len(a.group.Files))
+	for i, f := range a.group.Files {
+		paths[i] = f.Path
+	}
+	return paths
+}
+
+// InteractiveDelete presents all tree + file-level dup actions in a single
+// merged queue sorted by reclaimable bytes descending, with a uniform
+// numeric prompt shared by both kinds.
 func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []ScannedFile, cfg *Config) error {
 	if len(treePairs) == 0 && len(groups) == 0 {
 		return nil
 	}
 
-	reader := bufio.NewReader(os.Stdin)
-	deleted := make(map[string]bool) // tracks paths already removed
-
-	// ── Phase 1: tree duplicates ────────────────────────────────────────────
-	if len(treePairs) > 0 {
-		var treeTotal int64
-		for _, t := range treePairs {
-			treeTotal += t.TotalSize
-		}
-		fmt.Fprintf(os.Stderr,
-			"\n%d complete tree duplicate(s) found (%s reclaimable each copy).\n",
-			len(treePairs), FormatSize(treeTotal))
-		fmt.Fprint(os.Stderr, "Handle tree duplicates first? [Y/n] ")
-		ans, _ := reader.ReadString('\n')
-		if strings.ToLower(strings.TrimSpace(ans)) != "n" {
-			if err := handleTreeDups(treePairs, allFiles, reader, deleted, cfg); err != nil {
-				return err
-			}
-		}
+	// Orient so the less-frequent backup cadence sits at index [1] — auto
+	// mode preserves that slot in both kinds.
+	reorientPairsByBackupCadence(treePairs)
+	for i := range groups {
+		reorientFilesByBackupCadence(groups[i].Files)
 	}
 
-	// ── Phase 2: file-level duplicates ──────────────────────────────────────
-	// Filter groups: remove files already deleted and skip groups with < 2 survivors
-	remaining := filterGroups(groups, deleted)
-	if len(remaining) == 0 {
-		if len(groups) > 0 {
-			fmt.Fprintln(os.Stderr, "\nAll file-level duplicates already handled via tree deletion.")
+	actions := make([]cleanupAction, 0, len(treePairs)+len(groups))
+	for _, t := range treePairs {
+		actions = append(actions, cleanupAction{kind: actionTree, tree: t})
+	}
+	for _, g := range groups {
+		actions = append(actions, cleanupAction{kind: actionFileGroup, group: g})
+	}
+	sort.SliceStable(actions, func(i, j int) bool {
+		return actions[i].waste() > actions[j].waste()
+	})
+
+	reader := bufio.NewReader(os.Stdin)
+	deleted := make(map[string]bool)
+
+	var treeWaste, fileWaste int64
+	var treeCount, fileCount int
+	for i := range actions {
+		if actions[i].kind == actionTree {
+			treeWaste += actions[i].waste()
+			treeCount++
+		} else {
+			fileWaste += actions[i].waste()
+			fileCount++
 		}
+	}
+	fmt.Fprintf(os.Stderr,
+		"\n%d action(s) to review — %d tree(s) (%s) + %d file group(s) (%s). Sorted by reclaimable bytes desc.\n",
+		len(actions), treeCount, FormatSize(treeWaste), fileCount, FormatSize(fileWaste))
+	fmt.Fprintln(os.Stderr, "(Tree and file-level totals may overlap when the same bytes appear in both.)")
+	fmt.Fprint(os.Stderr, "Proceed to interactive deletion? [y/N] ")
+	ans, _ := reader.ReadString('\n')
+	if strings.ToLower(strings.TrimSpace(ans)) != "y" {
 		printGrandTotal(deleted)
 		return nil
 	}
 
-	// Order by reclaimable bytes desc (size × extra copies), so groups that free
-	// the most space come first regardless of individual file size.
-	sort.Slice(remaining, func(i, j int) bool {
-		return remaining[i].WastedBytes() > remaining[j].WastedBytes()
-	})
+	autoMode := false
 
-	var fileTotal int64
-	for _, g := range remaining {
-		fileTotal += g.WastedBytes()
-	}
-	fmt.Fprintf(os.Stderr,
-		"\n%d file-level duplicate group(s) remaining (%s reclaimable).\n",
-		len(remaining), FormatSize(fileTotal))
-	fmt.Fprint(os.Stderr, "Proceed to interactive file-level deletion? [y/N] ")
-	ans, _ := reader.ReadString('\n')
-	if strings.ToLower(strings.TrimSpace(ans)) == "y" {
-		if err := handleFileDups(remaining, reader, deleted, cfg); err != nil {
-			return err
+	for i := range actions {
+		a := &actions[i]
+
+		// Re-resolve survivors against already-deleted paths (prior actions
+		// in this loop may have removed files that also belong here).
+		switch a.kind {
+		case actionTree:
+			if dirFullyDeleted(a.tree.DirA, allFiles, deleted) || dirFullyDeleted(a.tree.DirB, allFiles, deleted) {
+				continue
+			}
+		case actionFileGroup:
+			var survivors []ScannedFile
+			for _, f := range a.group.Files {
+				if !deleted[f.Path] {
+					survivors = append(survivors, f)
+				}
+			}
+			if len(survivors) < 2 {
+				continue
+			}
+			a.group.Files = survivors
+		}
+
+		if autoMode {
+			applyAuto(a, allFiles, deleted, cfg)
+			continue
+		}
+
+		stop := promptAction(i+1, len(actions), a, allFiles, reader, deleted, cfg, &autoMode)
+		if stop {
+			break
 		}
 	}
 
@@ -95,72 +138,122 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []Sc
 	return nil
 }
 
-// ── Tree deletion ────────────────────────────────────────────────────────────
+// promptAction renders one action and handles user input. Returns true if the
+// user requested to quit.
+func promptAction(idx, total int, a *cleanupAction, allFiles []ScannedFile, reader *bufio.Reader, deleted map[string]bool, cfg *Config, autoMode *bool) bool {
+	items := a.items()
+	kindLabel := "file group"
+	if a.kind == actionTree {
+		kindLabel = "tree"
+	}
 
-func handleTreeDups(pairs []TreeDupPair, allFiles []ScannedFile, reader *bufio.Reader, deleted map[string]bool, cfg *Config) error {
-	autoMode := false
+	fmt.Fprintf(os.Stderr, "\n[%d/%d] %s reclaimable", idx, total, FormatSize(a.waste()))
+	if a.kind == actionTree {
+		fmt.Fprintf(os.Stderr, " (%s, %d files identical)\n", kindLabel, a.tree.FileCount)
+	} else {
+		fmt.Fprintf(os.Stderr, " (%s, %s × %d extra copies)\n",
+			kindLabel, FormatSize(a.group.Size), len(a.group.Files)-1)
+	}
+	for i, p := range items {
+		fmt.Fprintf(os.Stderr, "  [%d] %s\n", i+1, p)
+	}
 
-	// Orient pairs so the less-frequent backup cadence (quarterly > monthly >
-	// weekly > daily) sits in slot A, which is the one `auto` keeps.
-	reorientPairsByBackupCadence(pairs)
-
-	for i, t := range pairs {
-		// Skip pairs where a side has already been fully deleted in this session.
-		if dirFullyDeleted(t.DirA, allFiles, deleted) || dirFullyDeleted(t.DirB, allFiles, deleted) {
-			continue
+	for {
+		if len(items) == 2 {
+			fmt.Fprint(os.Stderr, "  Delete [1], [2], [s]kip, [a]uto-keep-first, [q]uit, [?]help: ")
+		} else {
+			fmt.Fprint(os.Stderr, "  Delete which? (e.g. 2,3 or 2-4,6), [s]kip, [a]uto, [q]uit, [?]help: ")
 		}
+		line, _ := reader.ReadString('\n')
+		line = strings.TrimSpace(strings.ToLower(line))
 
-		if autoMode {
-			deleteTree(t.DirB, allFiles, deleted, cfg)
-			continue
+		switch line {
+		case "?":
+			printActionHelp()
+		case "", "s":
+			return false
+		case "q":
+			return true
+		case "a":
+			*autoMode = true
+			applyAuto(a, allFiles, deleted, cfg)
+			return false
+		default:
+			indices, ok := parseIndices(line, len(items))
+			if !ok {
+				fmt.Fprintln(os.Stderr, "  Invalid input. Enter number(s), range(s), s, a, q, or ?")
+				continue
+			}
+			if len(indices) >= len(items) {
+				fmt.Fprintf(os.Stderr, "  Refusing: would delete all %d copies (no survivor left). Pick fewer.\n", len(items))
+				continue
+			}
+			fmt.Fprintln(os.Stderr, "  Will delete:")
+			for _, j := range indices {
+				fmt.Fprintf(os.Stderr, "    %s\n", items[j])
+			}
+			fmt.Fprint(os.Stderr, "  Confirm? [Y/n] ")
+			confirm, _ := reader.ReadString('\n')
+			if strings.ToLower(strings.TrimSpace(confirm)) == "n" {
+				continue
+			}
+			applyIndices(a, indices, allFiles, deleted, cfg)
+			return false
 		}
+	}
+}
 
-		fmt.Fprintf(os.Stderr, "\n[T%d/%d] %s  (%d files identical)\n",
-			i+1, len(pairs), FormatSize(t.TotalSize), t.FileCount)
-		fmt.Fprintf(os.Stderr, "  [A] %s\n", t.DirA)
-		fmt.Fprintf(os.Stderr, "  [B] %s\n", t.DirB)
+// applyAuto keeps index [0] and deletes the rest (for trees, index [0] is
+// the less-frequent cadence when cadence reordering applied).
+func applyAuto(a *cleanupAction, allFiles []ScannedFile, deleted map[string]bool, cfg *Config) {
+	n := 2
+	if a.kind == actionFileGroup {
+		n = len(a.group.Files)
+	}
+	if n < 2 {
+		return
+	}
+	rest := make([]int, 0, n-1)
+	for i := 1; i < n; i++ {
+		rest = append(rest, i)
+	}
+	applyIndices(a, rest, allFiles, deleted, cfg)
+}
 
-	prompt:
-		for {
-			fmt.Fprint(os.Stderr, "  Delete [A], [B], [s]kip, [a]uto-delete-B, [q]uit, [?]help: ")
-			line, _ := reader.ReadString('\n')
-			line = strings.TrimSpace(line) // preserve case: A ≠ a
-
-			switch line {
-			case "?":
-				printTreeHelp()
-			case "", "s", "S":
-				break prompt
-			case "q", "Q":
-				return nil
-			case "A":
-				confirmAndDeleteTree("A", t.DirA, allFiles, reader, deleted, cfg)
-				break prompt
-			case "B", "b":
-				confirmAndDeleteTree("B", t.DirB, allFiles, reader, deleted, cfg)
-				break prompt
-			case "a":
-				autoMode = true
-				deleteTree(t.DirB, allFiles, deleted, cfg)
-				break prompt
-			default:
-				fmt.Fprintln(os.Stderr, "  Invalid input. Enter A, B, s, a, q, or ?")
+// applyIndices runs the actual deletions for the selected 0-based indices.
+func applyIndices(a *cleanupAction, indices []int, allFiles []ScannedFile, deleted map[string]bool, cfg *Config) {
+	switch a.kind {
+	case actionTree:
+		items := a.items()
+		for _, j := range indices {
+			deleteTree(items[j], allFiles, deleted, cfg)
+		}
+	case actionFileGroup:
+		for _, j := range indices {
+			if !deleted[a.group.Files[j].Path] {
+				removeFile(a.group.Files[j].Path, a.group.Size, deleted, cfg)
 			}
 		}
 	}
-	return nil
 }
 
-func confirmAndDeleteTree(label, dir string, allFiles []ScannedFile, reader *bufio.Reader, deleted map[string]bool, cfg *Config) {
-	files := filesUnderDir(dir, allFiles)
-	fmt.Fprintf(os.Stderr, "  Will delete entire tree [%s]: %s  (%d files)\n", label, dir, len(files))
-	fmt.Fprint(os.Stderr, "  Confirm? [Y/n] ")
-	confirm, _ := reader.ReadString('\n')
-	if strings.ToLower(strings.TrimSpace(confirm)) == "n" {
-		return
-	}
-	deleteTree(dir, allFiles, deleted, cfg)
+func printActionHelp() {
+	fmt.Fprintln(os.Stderr, `
+  Deletion commands:
+    1        delete copy [1], keep the rest
+    2        delete copy [2], keep the rest
+    1,3      delete copies [1] and [3]
+    2-5      delete copies [2] through [5] inclusive
+    1-3,5    mix ranges and singles (skips 4)
+    s        skip this action
+    a        auto mode: keep [1], delete rest for this and all remaining actions
+    q        quit
+    ?        show this help
+  (selecting all copies is rejected — at least one must survive)
+  Tree actions: [N] is a directory; deleting removes the entire subtree.`)
 }
+
+// ── Deletion primitives ─────────────────────────────────────────────────────
 
 func deleteTree(dir string, allFiles []ScannedFile, deleted map[string]bool, cfg *Config) {
 	files := filesUnderDir(dir, allFiles)
@@ -177,20 +270,18 @@ func deleteTree(dir string, allFiles []ScannedFile, deleted map[string]bool, cfg
 			}
 		}
 	}
-	// Remove empty directories bottom-up
 	pruneEmptyDirs(dir)
 	fmt.Fprintf(os.Stderr, "  Deleted %d files from %s\n", len(files), dir)
 }
 
 // pruneEmptyDirs removes empty directories inside root, bottom-up.
 func pruneEmptyDirs(root string) {
-	// Walk in reverse to clean up empty subdirs before parents
 	var dirs []string
 	_ = walkDirs(root, &dirs)
 	for i := len(dirs) - 1; i >= 0; i-- {
-		_ = os.Remove(dirs[i]) // only succeeds if empty
+		_ = os.Remove(dirs[i])
 	}
-	_ = os.Remove(root) // remove root itself if empty
+	_ = os.Remove(root)
 }
 
 func walkDirs(root string, dirs *[]string) error {
@@ -208,101 +299,6 @@ func walkDirs(root string, dirs *[]string) error {
 	return nil
 }
 
-func printTreeHelp() {
-	fmt.Fprintln(os.Stderr, `
-  Tree deletion commands:
-    A    delete directory [A] entirely (keeping [B])
-    B    delete directory [B] entirely (keeping [A])
-    s    skip this pair
-    a    auto mode: delete [B] for this and all remaining tree pairs
-    q    quit tree phase (proceed to file-level)
-    ?    show this help`)
-}
-
-// ── File-level deletion ──────────────────────────────────────────────────────
-
-func handleFileDups(groups []DupGroup, reader *bufio.Reader, deleted map[string]bool, cfg *Config) error {
-	autoMode := false
-
-	for i := range groups {
-		reorientFilesByBackupCadence(groups[i].Files)
-	}
-
-	for i, g := range groups {
-		if autoMode {
-			for _, f := range g.Files[1:] {
-				if !deleted[f.Path] {
-					removeFile(f.Path, g.Size, deleted, cfg)
-				}
-			}
-			continue
-		}
-
-		fmt.Fprintf(os.Stderr, "\n[%d/%d] %s reclaimable (%s × %d extra copies)\n",
-			i+1, len(groups), FormatSize(g.WastedBytes()), FormatSize(g.Size), len(g.Files)-1)
-		for j, f := range g.Files {
-			fmt.Fprintf(os.Stderr, "  [%d] %s\n", j+1, f.Path)
-		}
-
-	prompt:
-		for {
-			if len(g.Files) == 2 {
-				fmt.Fprint(os.Stderr, "  Delete [1], [2], [s]kip, [a]uto-keep-first, [q]uit, [?]help: ")
-			} else {
-				fmt.Fprintf(os.Stderr, "  Delete which? (e.g. 2,3 or 2-4,6), [s]kip, [a]uto, [q]uit, [?]help: ")
-			}
-
-			line, _ := reader.ReadString('\n')
-			line = strings.TrimSpace(strings.ToLower(line))
-
-			switch line {
-			case "?":
-				printFileHelp()
-			case "", "s":
-				break prompt
-			case "q":
-				return nil
-			case "a":
-				autoMode = true
-				for _, f := range g.Files[1:] {
-					if !deleted[f.Path] {
-						removeFile(f.Path, g.Size, deleted, cfg)
-					}
-				}
-				break prompt
-			default:
-				indices, ok := parseIndices(line, len(g.Files))
-				if !ok {
-					fmt.Fprintln(os.Stderr, "  Invalid input. Enter number(s), s, a, q, or ?")
-					continue
-				}
-				if len(indices) >= len(g.Files) {
-					fmt.Fprintf(os.Stderr, "  Refusing: would delete all %d copies (no survivor left). Pick fewer.\n", len(g.Files))
-					continue
-				}
-				fmt.Fprintln(os.Stderr, "  Will delete:")
-				for _, idx := range indices {
-					fmt.Fprintf(os.Stderr, "    %s\n", g.Files[idx].Path)
-				}
-				fmt.Fprint(os.Stderr, "  Confirm? [Y/n] ")
-				confirm, _ := reader.ReadString('\n')
-				if strings.ToLower(strings.TrimSpace(confirm)) == "n" {
-					continue
-				}
-				for _, idx := range indices {
-					if !deleted[g.Files[idx].Path] {
-						removeFile(g.Files[idx].Path, g.Size, deleted, cfg)
-					}
-				}
-				break prompt
-			}
-		}
-	}
-	return nil
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
 func removeFile(path string, _ int64, deleted map[string]bool, cfg *Config) {
 	if err := os.Remove(path); err != nil {
 		fmt.Fprintf(os.Stderr, "  error: %v\n", err)
@@ -312,23 +308,6 @@ func removeFile(path string, _ int64, deleted map[string]bool, cfg *Config) {
 	if cfg.Verbose {
 		fmt.Fprintf(os.Stderr, "  deleted: %s\n", path)
 	}
-}
-
-// filterGroups removes already-deleted files and drops groups with < 2 survivors.
-func filterGroups(groups []DupGroup, deleted map[string]bool) []DupGroup {
-	var result []DupGroup
-	for _, g := range groups {
-		var survivors []ScannedFile
-		for _, f := range g.Files {
-			if !deleted[f.Path] {
-				survivors = append(survivors, f)
-			}
-		}
-		if len(survivors) >= 2 {
-			result = append(result, DupGroup{Size: g.Size, Files: survivors})
-		}
-	}
-	return result
 }
 
 func printGrandTotal(deleted map[string]bool) {
@@ -375,20 +354,21 @@ func parseIndices(input string, max int) ([]int, bool) {
 	return result, len(result) > 0
 }
 
-func printFileHelp() {
-	fmt.Fprintln(os.Stderr, `
-  File deletion commands:
-    1        delete copy [1], keep the rest
-    2        delete copy [2], keep the rest
-    1,3      delete copies [1] and [3]
-    2-5      delete copies [2] through [5] inclusive
-    1-3,5    mix ranges and singles (skips 4)
-    s        skip this group
-    a        auto mode: keep [1], delete rest for this and all remaining groups
-    q        quit
-    ?        show this help
-  (selecting all copies is rejected — at least one must survive)`)
+// dirFullyDeleted returns true if every file under dir has been removed.
+func dirFullyDeleted(dir string, allFiles []ScannedFile, deleted map[string]bool) bool {
+	files := filesUnderDir(dir, allFiles)
+	if len(files) == 0 {
+		return false
+	}
+	for _, f := range files {
+		if !deleted[f.Path] {
+			return false
+		}
+	}
+	return true
 }
+
+// ── Backup-cadence reorientation ────────────────────────────────────────────
 
 // Keep daily < weekly < monthly < quarterly — lower = more frequent =
 // shorter retention = safer to delete.
@@ -406,9 +386,8 @@ var cadenceRank = map[string]int{
 var cadenceRegex = regexp.MustCompile(`(?i)^(.*?)\b(daily|weekly|monthly|quarterly)\b[^/]*(/.*)?$`)
 
 // reorientPairsByBackupCadence swaps DirA/DirB in-place when both paths share
-// the same prefix and trailing path and differ only within the cadence segment
-// (cadence word + per-cadence numeric suffix). Ensures the less-frequent
-// cadence ends up in slot A (the one auto-mode preserves).
+// the same prefix and trailing path and differ only within the cadence
+// segment, so the less-frequent cadence ends up in slot A (auto preserves it).
 func reorientPairsByBackupCadence(pairs []TreeDupPair) {
 	for i := range pairs {
 		a := cadenceRegex.FindStringSubmatch(pairs[i].DirA)
@@ -429,9 +408,8 @@ func reorientPairsByBackupCadence(pairs []TreeDupPair) {
 
 // reorientFilesByBackupCadence reorders a dup group's files so that, when all
 // paths differ only within a cadence segment (same prefix and trailing path),
-// the least-frequent cadence ends up first. Auto mode keeps index [0], so the
-// longer-retention copy survives. No-op when any file fails to match or the
-// surrounding context isn't uniform.
+// the least-frequent cadence ends up first. No-op when any file fails to
+// match or the surrounding context isn't uniform.
 func reorientFilesByBackupCadence(files []ScannedFile) {
 	if len(files) < 2 {
 		return
@@ -460,19 +438,4 @@ func reorientFilesByBackupCadence(files []ScannedFile) {
 		reordered[i] = files[j]
 	}
 	copy(files, reordered)
-}
-
-// dirFullyDeleted returns true if every file under dir (as recorded in allFiles)
-// has been deleted in this session. Used to skip pairs involving already-gone dirs.
-func dirFullyDeleted(dir string, allFiles []ScannedFile, deleted map[string]bool) bool {
-	files := filesUnderDir(dir, allFiles)
-	if len(files) == 0 {
-		return false
-	}
-	for _, f := range files {
-		if !deleted[f.Path] {
-			return false
-		}
-	}
-	return true
 }

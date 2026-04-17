@@ -58,7 +58,7 @@ func (s *TreeDupState) DeletedPaths() map[string]bool {
 	return out
 }
 
-// MarkDeleted records a path as deleted (called by OfferTreeDeletions).
+// MarkDeleted records a path as deleted.
 func (s *TreeDupState) MarkDeleted(path string) {
 	s.deletedPaths[path] = true
 }
