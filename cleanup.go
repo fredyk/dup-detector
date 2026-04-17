@@ -238,7 +238,8 @@ func handleFileDups(groups []DupGroup, reader *bufio.Reader, deleted map[string]
 			continue
 		}
 
-		fmt.Fprintf(os.Stderr, "\n[%d/%d] %s\n", i+1, len(groups), FormatSize(g.Size))
+		fmt.Fprintf(os.Stderr, "\n[%d/%d] %s reclaimable (%s × %d extra copies)\n",
+			i+1, len(groups), FormatSize(g.WastedBytes()), FormatSize(g.Size), len(g.Files)-1)
 		for j, f := range g.Files {
 			fmt.Fprintf(os.Stderr, "  [%d] %s\n", j+1, f.Path)
 		}
