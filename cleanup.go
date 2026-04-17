@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -68,6 +70,12 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []Sc
 		return nil
 	}
 
+	// Order by reclaimable bytes desc (size × extra copies), so groups that free
+	// the most space come first regardless of individual file size.
+	sort.Slice(remaining, func(i, j int) bool {
+		return remaining[i].WastedBytes() > remaining[j].WastedBytes()
+	})
+
 	var fileTotal int64
 	for _, g := range remaining {
 		fileTotal += g.WastedBytes()
@@ -91,6 +99,10 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []Sc
 
 func handleTreeDups(pairs []TreeDupPair, allFiles []ScannedFile, reader *bufio.Reader, deleted map[string]bool, cfg *Config) error {
 	autoMode := false
+
+	// Orient pairs so the less-frequent backup cadence (quarterly > monthly >
+	// weekly > daily) sits in slot A, which is the one `auto` keeps.
+	reorientPairsByBackupCadence(pairs)
 
 	for i, t := range pairs {
 		// Skip pairs where a side has already been fully deleted in this session.
@@ -212,6 +224,10 @@ func printTreeHelp() {
 func handleFileDups(groups []DupGroup, reader *bufio.Reader, deleted map[string]bool, cfg *Config) error {
 	autoMode := false
 
+	for i := range groups {
+		reorientFilesByBackupCadence(groups[i].Files)
+	}
+
 	for i, g := range groups {
 		if autoMode {
 			for _, f := range g.Files[1:] {
@@ -232,7 +248,7 @@ func handleFileDups(groups []DupGroup, reader *bufio.Reader, deleted map[string]
 			if len(g.Files) == 2 {
 				fmt.Fprint(os.Stderr, "  Delete [1], [2], [s]kip, [a]uto-keep-first, [q]uit, [?]help: ")
 			} else {
-				fmt.Fprintf(os.Stderr, "  Delete which? (e.g. 2,3), [s]kip, [a]uto, [q]uit, [?]help: ")
+				fmt.Fprintf(os.Stderr, "  Delete which? (e.g. 2,3 or 2-4,6), [s]kip, [a]uto, [q]uit, [?]help: ")
 			}
 
 			line, _ := reader.ReadString('\n')
@@ -257,6 +273,10 @@ func handleFileDups(groups []DupGroup, reader *bufio.Reader, deleted map[string]
 				indices, ok := parseIndices(line, len(g.Files))
 				if !ok {
 					fmt.Fprintln(os.Stderr, "  Invalid input. Enter number(s), s, a, q, or ?")
+					continue
+				}
+				if len(indices) >= len(g.Files) {
+					fmt.Fprintf(os.Stderr, "  Refusing: would delete all %d copies (no survivor left). Pick fewer.\n", len(g.Files))
 					continue
 				}
 				fmt.Fprintln(os.Stderr, "  Will delete:")
@@ -318,18 +338,38 @@ func printGrandTotal(deleted map[string]bool) {
 	}
 }
 
+// parseIndices accepts comma-separated numbers and ranges, e.g. "1,3-5,8".
+// Indices are 1-based in the input; returned slice is 0-based.
 func parseIndices(input string, max int) ([]int, bool) {
 	var result []int
 	seen := make(map[int]bool)
-	for _, part := range strings.Split(input, ",") {
-		n, err := strconv.Atoi(strings.TrimSpace(part))
-		if err != nil || n < 1 || n > max {
-			return nil, false
-		}
+	add := func(n int) {
 		if !seen[n-1] {
 			result = append(result, n-1)
 			seen[n-1] = true
 		}
+	}
+	for _, part := range strings.Split(input, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, false
+		}
+		if i := strings.Index(part, "-"); i > 0 {
+			lo, err1 := strconv.Atoi(strings.TrimSpace(part[:i]))
+			hi, err2 := strconv.Atoi(strings.TrimSpace(part[i+1:]))
+			if err1 != nil || err2 != nil || lo < 1 || hi > max || lo > hi {
+				return nil, false
+			}
+			for n := lo; n <= hi; n++ {
+				add(n)
+			}
+			continue
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 1 || n > max {
+			return nil, false
+		}
+		add(n)
 	}
 	return result, len(result) > 0
 }
@@ -340,10 +380,85 @@ func printFileHelp() {
     1        delete copy [1], keep the rest
     2        delete copy [2], keep the rest
     1,3      delete copies [1] and [3]
+    2-5      delete copies [2] through [5] inclusive
+    1-3,5    mix ranges and singles (skips 4)
     s        skip this group
     a        auto mode: keep [1], delete rest for this and all remaining groups
     q        quit
-    ?        show this help`)
+    ?        show this help
+  (selecting all copies is rejected — at least one must survive)`)
+}
+
+// Keep daily < weekly < monthly < quarterly — lower = more frequent =
+// shorter retention = safer to delete.
+var cadenceRank = map[string]int{
+	"daily":     0,
+	"weekly":    1,
+	"monthly":   2,
+	"quarterly": 3,
+}
+
+// Match the cadence word plus whatever trails in the same path segment
+// (e.g. "daily-1-sunday", "weekly-2", "monthly-04-april", "quarterly-2026-1").
+// Group 1 = prefix before cadence, 2 = cadence word, 3 = trailing path from
+// the next '/' onwards (or empty if cadence ends the path).
+var cadenceRegex = regexp.MustCompile(`(?i)^(.*?)\b(daily|weekly|monthly|quarterly)\b[^/]*(/.*)?$`)
+
+// reorientPairsByBackupCadence swaps DirA/DirB in-place when both paths share
+// the same prefix and trailing path and differ only within the cadence segment
+// (cadence word + per-cadence numeric suffix). Ensures the less-frequent
+// cadence ends up in slot A (the one auto-mode preserves).
+func reorientPairsByBackupCadence(pairs []TreeDupPair) {
+	for i := range pairs {
+		a := cadenceRegex.FindStringSubmatch(pairs[i].DirA)
+		b := cadenceRegex.FindStringSubmatch(pairs[i].DirB)
+		if a == nil || b == nil {
+			continue
+		}
+		if a[1] != b[1] || a[3] != b[3] {
+			continue
+		}
+		rankA := cadenceRank[strings.ToLower(a[2])]
+		rankB := cadenceRank[strings.ToLower(b[2])]
+		if rankA < rankB {
+			pairs[i].DirA, pairs[i].DirB = pairs[i].DirB, pairs[i].DirA
+		}
+	}
+}
+
+// reorientFilesByBackupCadence reorders a dup group's files so that, when all
+// paths differ only within a cadence segment (same prefix and trailing path),
+// the least-frequent cadence ends up first. Auto mode keeps index [0], so the
+// longer-retention copy survives. No-op when any file fails to match or the
+// surrounding context isn't uniform.
+func reorientFilesByBackupCadence(files []ScannedFile) {
+	if len(files) < 2 {
+		return
+	}
+	ranks := make([]int, len(files))
+	var prefix, suffix string
+	for i, f := range files {
+		sub := cadenceRegex.FindStringSubmatch(f.Path)
+		if sub == nil {
+			return
+		}
+		if i == 0 {
+			prefix, suffix = sub[1], sub[3]
+		} else if sub[1] != prefix || sub[3] != suffix {
+			return
+		}
+		ranks[i] = cadenceRank[strings.ToLower(sub[2])]
+	}
+	idx := make([]int, len(files))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool { return ranks[idx[a]] > ranks[idx[b]] })
+	reordered := make([]ScannedFile, len(files))
+	for i, j := range idx {
+		reordered[i] = files[j]
+	}
+	copy(files, reordered)
 }
 
 // dirFullyDeleted returns true if every file under dir (as recorded in allFiles)
