@@ -21,8 +21,9 @@ type Config struct {
 	ExcludeFrom string
 	Includes    []string
 	IncludeFrom string
-	MinSizeStr  string
-	MaxSizeStr  string
+	MinSizeStr    string
+	MaxSizeStr    string
+	OneFileSystem bool
 
 	// Output
 	Format string
@@ -95,6 +96,8 @@ func init() {
 		"output format: columns, json, csv, simple")
 	f.IntVar(&cfg.Workers, "workers", 0,
 		"parallel MD5 workers (default: number of CPUs)")
+	f.BoolVar(&cfg.OneFileSystem, "one-file-system", false,
+		"don't cross filesystem boundaries (skip nested mounts)")
 }
 
 func main() {
@@ -187,8 +190,12 @@ func run(_ *cobra.Command, args []string) error {
 		}
 	}
 
+	// Shared inode map: also catches hardlinks pointing to the same inode
+	// across DIR_A and DIR_B when they live on the same filesystem.
+	seenInodes := make(map[[2]uint64]string)
+
 	status("Scanning %s ...\n", dirA)
-	filesA, err := Scan(dirA, &cfg, excludeFromA)
+	filesA, err := Scan(dirA, &cfg, excludeFromA, seenInodes)
 	if err != nil {
 		return fmt.Errorf("scanning %s: %w", dirA, err)
 	}
@@ -196,7 +203,7 @@ func run(_ *cobra.Command, args []string) error {
 	var filesB []ScannedFile
 	if twoDir {
 		status("Scanning %s ...\n", dirB)
-		filesB, err = Scan(dirB, &cfg, excludeFromB)
+		filesB, err = Scan(dirB, &cfg, excludeFromB, seenInodes)
 		if err != nil {
 			return fmt.Errorf("scanning %s: %w", dirB, err)
 		}

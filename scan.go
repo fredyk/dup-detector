@@ -18,13 +18,34 @@ type ScannedFile struct {
 
 // Scan walks root and returns all files that pass the configured filters.
 // absExcludes is a list of absolute directory paths to skip entirely.
-func Scan(root string, cfg *Config, absExcludes []string) ([]ScannedFile, error) {
+// seenInodes (optional, pass nil to start fresh) is a shared (Dev,Ino) map
+// used to skip hardlinks pointing at an already-seen inode — deleting those
+// wouldn't reclaim space. Pass the same map across multiple Scan calls to
+// also catch cross-directory hardlinks.
+func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint64]string) ([]ScannedFile, error) {
 	var files []ScannedFile
 	var count int64
+	var hardlinkCount int64
+
+	if seenInodes == nil {
+		seenInodes = make(map[[2]uint64]string)
+	}
 
 	normExcludes := make([]string, len(absExcludes))
 	for i, d := range absExcludes {
 		normExcludes[i] = filepath.Clean(d)
+	}
+
+	// Capture root's filesystem device for --one-file-system checks.
+	var rootDev uint64
+	var rootDevOk bool
+	if cfg.OneFileSystem {
+		if rootInfo, err := os.Stat(root); err == nil {
+			if key, ok := inodeKey(rootInfo); ok {
+				rootDev = key[0]
+				rootDevOk = true
+			}
+		}
 	}
 
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
@@ -71,8 +92,19 @@ func Scan(root string, cfg *Config, absExcludes []string) ([]ScannedFile, error)
 		}
 
 		if d.IsDir() {
-			if !cfg.Recursive {
+			if !cfg.Recursive && path != root {
 				return filepath.SkipDir
+			}
+			// --one-file-system: skip subdirs on a different filesystem (nested mounts).
+			if rootDevOk && path != root {
+				if info, err := d.Info(); err == nil {
+					if key, ok := inodeKey(info); ok && key[0] != rootDev {
+						if cfg.Verbose {
+							fmt.Fprintf(os.Stderr, "  skipping nested mount: %s\n", path)
+						}
+						return filepath.SkipDir
+					}
+				}
 			}
 			return nil
 		}
@@ -85,6 +117,18 @@ func Scan(root string, cfg *Config, absExcludes []string) ([]ScannedFile, error)
 		info, err := d.Info()
 		if err != nil {
 			return nil
+		}
+
+		// Skip hardlinks to inodes already seen — deleting these reclaims no bytes.
+		if key, ok := inodeKey(info); ok {
+			if prev, exists := seenInodes[key]; exists {
+				atomic.AddInt64(&hardlinkCount, 1)
+				if cfg.Verbose {
+					fmt.Fprintf(os.Stderr, "  hardlink: %s → %s (skipped)\n", path, prev)
+				}
+				return nil
+			}
+			seenInodes[key] = path
 		}
 
 		size := info.Size()
@@ -113,6 +157,9 @@ func Scan(root string, cfg *Config, absExcludes []string) ([]ScannedFile, error)
 
 	if cfg.Progress && count > 0 {
 		fmt.Fprintf(os.Stderr, "\r  %d files scanned    \n", count)
+	}
+	if (cfg.Progress || cfg.Verbose) && hardlinkCount > 0 {
+		fmt.Fprintf(os.Stderr, "  skipped %d hardlink(s) to previously-seen inodes\n", hardlinkCount)
 	}
 
 	return files, err
