@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 )
 
 // ScannedFile holds metadata for a scanned file.
@@ -24,8 +23,8 @@ type ScannedFile struct {
 // also catch cross-directory hardlinks.
 func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint64]string) ([]ScannedFile, error) {
 	var files []ScannedFile
-	var count int64
-	var hardlinkCount int64
+	var count int
+	var hardlinkCount int
 
 	if seenInodes == nil {
 		seenInodes = make(map[[2]uint64]string)
@@ -109,8 +108,10 @@ func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint
 			return nil
 		}
 
-		// Skip symlinks
-		if d.Type()&os.ModeSymlink != 0 {
+		// Only regular files. Rules out symlinks, sockets, FIFOs, device
+		// nodes and named pipes — opening a FIFO or socket with md5File
+		// would block the scan indefinitely.
+		if !d.Type().IsRegular() {
 			return nil
 		}
 
@@ -122,7 +123,7 @@ func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint
 		// Skip hardlinks to inodes already seen — deleting these reclaims no bytes.
 		if key, ok := inodeKey(info); ok {
 			if prev, exists := seenInodes[key]; exists {
-				atomic.AddInt64(&hardlinkCount, 1)
+				hardlinkCount++
 				if cfg.Verbose {
 					fmt.Fprintf(os.Stderr, "  hardlink: %s → %s (skipped)\n", path, prev)
 				}
@@ -147,9 +148,9 @@ func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint
 			ModTime: info.ModTime().Unix(),
 		})
 
-		n := atomic.AddInt64(&count, 1)
-		if cfg.Progress && n%500 == 0 {
-			fmt.Fprintf(os.Stderr, "\r  %d files scanned...", n)
+		count++
+		if cfg.Progress && count%500 == 0 {
+			fmt.Fprintf(os.Stderr, "\r  %d files scanned...", count)
 		}
 
 		return nil

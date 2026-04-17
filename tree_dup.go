@@ -25,9 +25,7 @@ type TreeDupState struct {
 	dupIndex     map[string][]string // filePath → []duplicatePaths
 	checkedPairs map[dirKey]bool     // already verified (confirmed or rejected)
 	Confirmed    []TreeDupPair
-	handledIdx   int             // index into Confirmed up to which trees have been offered
-	deletedPaths map[string]bool // files deleted during progressive phase
-	Workers      int             // parallel workers for pair verification (0 = NumCPU)
+	Workers      int                   // parallel workers for pair verification (0 = NumCPU)
 	OnProgress   func(done, total int) // called after each verified pair; may be nil
 }
 
@@ -45,32 +43,7 @@ func NewTreeDupState() *TreeDupState {
 	return &TreeDupState{
 		dupIndex:     make(map[string][]string),
 		checkedPairs: make(map[dirKey]bool),
-		deletedPaths: make(map[string]bool),
 	}
-}
-
-// DeletedPaths returns a copy of all paths deleted during progressive handling.
-func (s *TreeDupState) DeletedPaths() map[string]bool {
-	out := make(map[string]bool, len(s.deletedPaths))
-	for k, v := range s.deletedPaths {
-		out[k] = v
-	}
-	return out
-}
-
-// MarkDeleted records a path as deleted.
-func (s *TreeDupState) MarkDeleted(path string) {
-	s.deletedPaths[path] = true
-}
-
-// MarkHandled advances the handled index after a batch of trees has been offered.
-func (s *TreeDupState) MarkHandled() {
-	s.handledIdx = len(s.Confirmed)
-}
-
-// UnhandledTrees returns trees in Confirmed that haven't been offered yet.
-func (s *TreeDupState) UnhandledTrees() []TreeDupPair {
-	return s.Confirmed[s.handledIdx:]
 }
 
 // AddGroups ingests new dup groups and returns any newly discovered tree dup pairs.
@@ -303,20 +276,30 @@ func FindTreeDupsByHash(allFiles []ScannedFile, onProgress func(done, total int)
 		// Walk up the entire directory tree using zero-allocation string slicing.
 		// Each ancestor accumulates the file's contribution with its own relative path.
 		p := f.Path
-		current := p[:strings.LastIndexByte(p, '/')] // immediate parent, no alloc
+		sep := strings.LastIndexByte(p, '/')
+		if sep < 0 {
+			continue // relative path with no separator — nothing to accumulate under
+		}
+		current := p[:sep] // immediate parent, no alloc
 		if current == "" {
 			current = "/"
 		}
 
 		for {
-			dirLen := len(current)
 			dd := accum[current]
 			if dd == nil {
 				dd = &dirAccum{}
 				accum[current] = dd
 			}
-			// relPath = everything after the trailing slash — zero allocation
-			dd.hash += hashTreeEntry(p[dirLen+1:], f.Size, f.ModTime)
+			// relPath = everything past the separator between current and the
+			// remainder. For current == "/" that's p[1:]; otherwise p[len(current)+1:].
+			var relPath string
+			if current == "/" {
+				relPath = p[1:]
+			} else {
+				relPath = p[len(current)+1:]
+			}
+			dd.hash += hashTreeEntry(relPath, f.Size, f.ModTime)
 			dd.fileCount++
 			dd.totalSize += f.Size
 

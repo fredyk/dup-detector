@@ -100,6 +100,7 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []Sc
 
 	autoMode := false
 
+	var skipped int
 	for i := range actions {
 		a := &actions[i]
 
@@ -108,6 +109,7 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []Sc
 		switch a.kind {
 		case actionTree:
 			if dirFullyDeleted(a.tree.DirA, allFiles, deleted) || dirFullyDeleted(a.tree.DirB, allFiles, deleted) {
+				skipped++
 				continue
 			}
 		case actionFileGroup:
@@ -118,6 +120,7 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []Sc
 				}
 			}
 			if len(survivors) < 2 {
+				skipped++
 				continue
 			}
 			a.group.Files = survivors
@@ -134,6 +137,9 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []Sc
 		}
 	}
 
+	if skipped > 0 {
+		fmt.Fprintf(os.Stderr, "\n(%d action(s) skipped automatically — already resolved by earlier deletions.)\n", skipped)
+	}
 	printGrandTotal(deleted)
 	return nil
 }
@@ -257,6 +263,7 @@ func printActionHelp() {
 
 func deleteTree(dir string, allFiles []ScannedFile, deleted map[string]bool, cfg *Config) {
 	files := filesUnderDir(dir, allFiles)
+	var removed int
 	for _, f := range files {
 		if deleted[f.Path] {
 			continue
@@ -265,13 +272,14 @@ func deleteTree(dir string, allFiles []ScannedFile, deleted map[string]bool, cfg
 			fmt.Fprintf(os.Stderr, "  error: %v\n", err)
 		} else {
 			deleted[f.Path] = true
+			removed++
 			if cfg.Verbose {
 				fmt.Fprintf(os.Stderr, "  deleted: %s\n", f.Path)
 			}
 		}
 	}
 	pruneEmptyDirs(dir)
-	fmt.Fprintf(os.Stderr, "  Deleted %d files from %s\n", len(files), dir)
+	fmt.Fprintf(os.Stderr, "  Deleted %d of %d file(s) from %s\n", removed, len(files), dir)
 }
 
 // pruneEmptyDirs removes empty directories inside root, bottom-up.

@@ -300,10 +300,8 @@ func run(_ *cobra.Command, args []string) error {
 		}
 	}
 
-	// Interactive deletion: any remaining unhandled trees + file-level dups
 	if !cfg.DryRun {
-		unhandledTrees := treeState.UnhandledTrees()
-		if err := InteractiveDelete(unhandledTrees, allGroups, allFiles, &cfg); err != nil {
+		if err := InteractiveDelete(treeState.Confirmed, allGroups, allFiles, &cfg); err != nil {
 			return err
 		}
 	}
