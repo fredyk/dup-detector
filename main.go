@@ -11,19 +11,24 @@ import (
 // Config holds all runtime options.
 type Config struct {
 	// rsync-compatible flags
-	Checksum    bool
-	Recursive   bool
-	Verbose     bool
-	Quiet       bool
-	DryRun      bool
-	Progress    bool
-	Excludes    []string
-	ExcludeFrom string
-	Includes    []string
-	IncludeFrom string
+	Checksum      bool
+	Recursive     bool
+	Verbose       bool
+	Quiet         bool
+	DryRun        bool
+	Progress      bool
+	Excludes      []string
+	ExcludeFrom   string
+	Includes      []string
+	IncludeFrom   string
 	MinSizeStr    string
 	MaxSizeStr    string
 	OneFileSystem bool
+
+	// Hash cache (only used in -c mode)
+	NoCache   bool
+	Rehash    bool
+	CachePath string
 
 	// Output
 	Format string
@@ -98,6 +103,12 @@ func init() {
 		"parallel MD5 workers (default: number of CPUs)")
 	f.BoolVar(&cfg.OneFileSystem, "one-file-system", false,
 		"don't cross filesystem boundaries (skip nested mounts)")
+	f.BoolVar(&cfg.NoCache, "no-cache", false,
+		"disable the on-disk MD5 cache (always re-read file contents)")
+	f.BoolVar(&cfg.Rehash, "rehash", false,
+		"ignore cached MD5s and recompute them (refreshes the cache)")
+	f.StringVar(&cfg.CachePath, "cache-path", "",
+		"path to the MD5 cache DB (default: ~/.cache/dup-detector/hashes.db)")
 }
 
 func main() {
@@ -247,7 +258,34 @@ func run(_ *cobra.Command, args []string) error {
 	if cfg.Checksum {
 		status("Detecting duplicates (MD5 pass, largest first)...\n")
 
-		err = ChecksumDups(filesA, filesB, twoDir, nil, cfg.Workers,
+		// Open the per-file MD5 cache so unchanged files aren't re-read on
+		// repeated runs. Failure to open is non-fatal — fall back to uncached.
+		var cache *HashCache
+		if !cfg.NoCache {
+			cachePath := cfg.CachePath
+			if cachePath == "" {
+				cachePath = DefaultCachePath()
+			}
+			if cachePath == "" {
+				status("warning: cannot locate cache dir; running without MD5 cache\n")
+			} else if c, cerr := OpenHashCache(cachePath, cfg.Rehash); cerr != nil {
+				status("warning: MD5 cache disabled (%v)\n", cerr)
+			} else {
+				cache = c
+				defer func() {
+					if !cfg.Quiet {
+						hits, misses := cache.Stats()
+						fmt.Fprintf(os.Stderr, "  MD5 cache: %d reused, %d computed (%s)\n",
+							hits, misses, cachePath)
+					}
+					if cerr := cache.Close(); cerr != nil {
+						fmt.Fprintf(os.Stderr, "warning: closing MD5 cache: %v\n", cerr)
+					}
+				}()
+			}
+		}
+
+		err = ChecksumDups(filesA, filesB, twoDir, nil, cfg.Workers, cache,
 			func(done, total int64) {
 				if cfg.Progress {
 					pct := int(100 * done / (total + 1))

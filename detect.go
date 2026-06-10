@@ -87,7 +87,7 @@ func MtimeDups(filesA, filesB []ScannedFile) []DupGroup {
 //   - onProgress: called after each size group with (bytesProcessed, totalBytes)
 //   - onBatch: called after each size group with newly found groups; return false to stop early
 func ChecksumDups(filesA, filesB []ScannedFile, twoDir bool, skip map[string]bool,
-	workers int, onProgress func(done, total int64), onBatch func([]DupGroup) bool) error {
+	workers int, cache *HashCache, onProgress func(done, total int64), onBatch func([]DupGroup) bool) error {
 
 	if workers <= 0 {
 		workers = runtime.NumCPU()
@@ -127,7 +127,7 @@ func ChecksumDups(filesA, filesB []ScannedFile, twoDir bool, skip map[string]boo
 			continue
 		}
 
-		newGroups, err := checksumGroup(candidates, size, twoDir, workers)
+		newGroups, err := checksumGroup(candidates, size, twoDir, workers, cache)
 		if err != nil {
 			return err
 		}
@@ -145,7 +145,7 @@ func ChecksumDups(filesA, filesB []ScannedFile, twoDir bool, skip map[string]boo
 }
 
 // checksumGroup computes MD5 for all candidates and returns dup groups.
-func checksumGroup(candidates []ScannedFile, size int64, twoDir bool, workers int) ([]DupGroup, error) {
+func checksumGroup(candidates []ScannedFile, size int64, twoDir bool, workers int, cache *HashCache) ([]DupGroup, error) {
 	type hashResult struct {
 		idx  int
 		hash string
@@ -163,7 +163,7 @@ func checksumGroup(candidates []ScannedFile, size int64, twoDir bool, workers in
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			hash, err := md5File(f.Path)
+			hash, err := cache.Hash(f)
 			results[i] = hashResult{i, hash, err}
 		}()
 	}
@@ -198,7 +198,7 @@ func DetectDups(filesA, filesB []ScannedFile, cfg *Config) ([]DupGroup, error) {
 	}
 	twoDir := len(filesB) > 0
 	var all []DupGroup
-	err := ChecksumDups(filesA, filesB, twoDir, nil, cfg.Workers,
+	err := ChecksumDups(filesA, filesB, twoDir, nil, cfg.Workers, nil,
 		func(done, total int64) {
 			if cfg.Progress {
 				pct := int(100 * done / (total + 1))

@@ -12,6 +12,7 @@ type ScannedFile struct {
 	RelPath string // relative to scan root
 	Size    int64
 	ModTime int64 // Unix timestamp
+	Inode   int64 // inode number (0 if unavailable); used to validate the hash cache
 	Source  int   // 0 = dir A, 1 = dir B
 }
 
@@ -121,7 +122,9 @@ func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint
 		}
 
 		// Skip hardlinks to inodes already seen — deleting these reclaims no bytes.
+		var inode int64
 		if key, ok := inodeKey(info); ok {
+			inode = int64(key[1])
 			if prev, exists := seenInodes[key]; exists {
 				hardlinkCount++
 				if cfg.Verbose {
@@ -146,6 +149,7 @@ func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint
 			RelPath: relPath,
 			Size:    size,
 			ModTime: info.ModTime().Unix(),
+			Inode:   inode,
 		})
 
 		count++

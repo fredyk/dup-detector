@@ -78,12 +78,30 @@ dup-detector --progress -v -c DIR_A DIR_B
 | `--min-size SIZE` | | | Skip files smaller than SIZE (e.g. `1k`, `10M`, `1G`) |
 | `--max-size SIZE` | | | Skip files larger than SIZE |
 | `--format FORMAT` | | `columns` | Output format: `columns`, `json`, `csv`, `simple` |
+| `--no-cache` | | false | Disable the on-disk MD5 cache (always re-read file contents) |
+| `--rehash` | | false | Ignore cached MD5s and recompute them (refreshes the cache) |
+| `--cache-path FILE` | | | Path to the MD5 cache DB (default: `~/.cache/dup-detector/hashes.db`) |
 
 ## Comparison modes
 
-**Default (size + mtime):** fast, good for comparing backups where files were copied preserving timestamps. May produce false positives for files with identical size and modification time but different content.
+**Default (size + mtime):** fast, good for comparing backups where files were copied preserving timestamps. **Misses real duplicates whose content is identical but whose mtime differs** (e.g. files re-downloaded, re-archived, or copied without `-p`/`--times`) — and may produce false positives for files with identical size and mtime but different content. Use `-c` for accuracy.
 
 **Checksum mode (`-c`, size + MD5):** slower but accurate. MD5 is only computed for files that share the same size (pre-filtered), so it's much faster than computing MD5 for everything.
+
+## MD5 cache
+
+In `-c` mode, every computed MD5 is cached in a small SQLite database
+(`~/.cache/dup-detector/hashes.db` by default). A cached hash is keyed by file
+path and validated by `(size, mtime, inode)`: on the next run, any file whose
+metadata is unchanged is **not re-read** — its hash comes straight from the
+cache. On a large, slow disk this turns a multi-hour second pass into little
+more than the directory walk.
+
+This is a **per-file hash cache, not a per-command result cache**: a file hashed
+once stays valid across every invocation, regardless of flags (`--min-size`,
+single- vs two-dir, different roots…). Concurrent runs share the cache safely
+(WAL mode). Use `--rehash` to force recomputation (e.g. if you suspect an
+in-place edit preserved size+mtime), or `--no-cache` to bypass it entirely.
 
 ## Interactive deletion
 
