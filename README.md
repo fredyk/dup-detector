@@ -81,12 +81,23 @@ dup-detector --progress -v -c DIR_A DIR_B
 | `--no-cache` | | false | Disable the on-disk MD5 cache (always re-read file contents) |
 | `--rehash` | | false | Ignore cached MD5s and recompute them (refreshes the cache) |
 | `--cache-path FILE` | | | Path to the MD5 cache DB (default: `~/.cache/dup-detector/hashes.db`) |
+| `--no-progressive` | | false | In `-c` mode, hash only after the full walk (don't overlap with it) |
 
 ## Comparison modes
 
 **Default (size + mtime):** fast, good for comparing backups where files were copied preserving timestamps. **Misses real duplicates whose content is identical but whose mtime differs** (e.g. files re-downloaded, re-archived, or copied without `-p`/`--times`) — and may produce false positives for files with identical size and mtime but different content. Use `-c` for accuracy.
 
 **Checksum mode (`-c`, size + MD5):** slower but accurate. MD5 is only computed for files that share the same size (pre-filtered), so it's much faster than computing MD5 for everything.
+
+### Progressive hashing
+
+In `-c` mode, hashing **overlaps with the directory walk** (and with the
+tree-duplicate pass): as soon as a second file of a given size is discovered,
+both are dispatched to a worker pool, so MD5 I/O runs concurrently with the
+traversal instead of waiting for it to finish. The size pre-filter is preserved
+— files with a unique size are never read. This shortens wall-clock most on a
+cold cache; on a warm cache the walk dominates anyway. Disable with
+`--no-progressive` to hash strictly after the walk (largest-first streaming).
 
 ## MD5 cache
 

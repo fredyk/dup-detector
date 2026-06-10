@@ -30,6 +30,9 @@ type Config struct {
 	Rehash    bool
 	CachePath string
 
+	// NoProgressive disables overlapping MD5 hashing with the walk (-c mode).
+	NoProgressive bool
+
 	// Output
 	Format string
 
@@ -109,6 +112,8 @@ func init() {
 		"ignore cached MD5s and recompute them (refreshes the cache)")
 	f.StringVar(&cfg.CachePath, "cache-path", "",
 		"path to the MD5 cache DB (default: ~/.cache/dup-detector/hashes.db)")
+	f.BoolVar(&cfg.NoProgressive, "no-progressive", false,
+		"in -c mode, hash files only after the full walk (don't overlap with it)")
 }
 
 func main() {
@@ -205,8 +210,48 @@ func run(_ *cobra.Command, args []string) error {
 	// across DIR_A and DIR_B when they live on the same filesystem.
 	seenInodes := make(map[[2]uint64]string)
 
+	// In -c mode, open the MD5 cache up front so it can serve the progressive
+	// hasher during the walk. A nil cache (disabled / failed to open) just
+	// means uncached reads.
+	var cache *HashCache
+	var cachePath string
+	if cfg.Checksum && !cfg.NoCache {
+		cachePath = cfg.CachePath
+		if cachePath == "" {
+			cachePath = DefaultCachePath()
+		}
+		if cachePath == "" {
+			status("warning: cannot locate cache dir; running without MD5 cache\n")
+		} else if c, cerr := OpenHashCache(cachePath, cfg.Rehash); cerr != nil {
+			status("warning: MD5 cache disabled (%v)\n", cerr)
+		} else {
+			cache = c
+			defer func() {
+				if !cfg.Quiet {
+					hits, misses := cache.Stats()
+					fmt.Fprintf(os.Stderr, "  MD5 cache: %d reused, %d computed (%s)\n",
+						hits, misses, cachePath)
+				}
+				if cerr := cache.Close(); cerr != nil {
+					fmt.Fprintf(os.Stderr, "warning: closing MD5 cache: %v\n", cerr)
+				}
+			}()
+		}
+	}
+
+	// Progressive hashing: in -c mode, hash size-colliding files as the walk
+	// discovers them, overlapping MD5 I/O with the traversal. Disabled by
+	// --no-progressive (falls back to the post-walk ChecksumDups path).
+	var ph *ProgressiveHasher
+	var onFileA, onFileB func(ScannedFile)
+	if cfg.Checksum && !cfg.NoProgressive {
+		ph = NewProgressiveHasher(cache, cfg.Workers, twoDir)
+		onFileA = func(f ScannedFile) { ph.OnFile(f, 0) }
+		onFileB = func(f ScannedFile) { ph.OnFile(f, 1) }
+	}
+
 	status("Scanning %s ...\n", dirA)
-	filesA, err := Scan(dirA, &cfg, excludeFromA, seenInodes)
+	filesA, err := Scan(dirA, &cfg, excludeFromA, seenInodes, onFileA)
 	if err != nil {
 		return fmt.Errorf("scanning %s: %w", dirA, err)
 	}
@@ -214,7 +259,7 @@ func run(_ *cobra.Command, args []string) error {
 	var filesB []ScannedFile
 	if twoDir {
 		status("Scanning %s ...\n", dirB)
-		filesB, err = Scan(dirB, &cfg, excludeFromB, seenInodes)
+		filesB, err = Scan(dirB, &cfg, excludeFromB, seenInodes, onFileB)
 		if err != nil {
 			return fmt.Errorf("scanning %s: %w", dirB, err)
 		}
@@ -254,37 +299,18 @@ func run(_ *cobra.Command, args []string) error {
 	// heuristic, no streaming interruption during MD5.
 	treeState.Confirmed = append(treeState.Confirmed, earlyTrees...)
 
-	// ── Phase 2: MD5 streaming (only if -c flag set) ─────────────────────────
-	if cfg.Checksum {
+	// ── Phase 2: MD5 (only if -c flag set) ───────────────────────────────────
+	switch {
+	case cfg.Checksum && ph != nil:
+		// Progressive: hashing overlapped the walk (and the tree pass above).
+		// Close drains the workers and returns the assembled groups.
+		status("Detecting duplicates (MD5 pass, progressive)...\n")
+		allGroups = ph.Close()
+		treeState.AddGroups(allGroups, allFiles, true)
+
+	case cfg.Checksum:
+		// Classic post-walk path (--no-progressive), processing largest-first.
 		status("Detecting duplicates (MD5 pass, largest first)...\n")
-
-		// Open the per-file MD5 cache so unchanged files aren't re-read on
-		// repeated runs. Failure to open is non-fatal — fall back to uncached.
-		var cache *HashCache
-		if !cfg.NoCache {
-			cachePath := cfg.CachePath
-			if cachePath == "" {
-				cachePath = DefaultCachePath()
-			}
-			if cachePath == "" {
-				status("warning: cannot locate cache dir; running without MD5 cache\n")
-			} else if c, cerr := OpenHashCache(cachePath, cfg.Rehash); cerr != nil {
-				status("warning: MD5 cache disabled (%v)\n", cerr)
-			} else {
-				cache = c
-				defer func() {
-					if !cfg.Quiet {
-						hits, misses := cache.Stats()
-						fmt.Fprintf(os.Stderr, "  MD5 cache: %d reused, %d computed (%s)\n",
-							hits, misses, cachePath)
-					}
-					if cerr := cache.Close(); cerr != nil {
-						fmt.Fprintf(os.Stderr, "warning: closing MD5 cache: %v\n", cerr)
-					}
-				}()
-			}
-		}
-
 		err = ChecksumDups(filesA, filesB, twoDir, nil, cfg.Workers, cache,
 			func(done, total int64) {
 				if cfg.Progress {
@@ -307,7 +333,8 @@ func run(_ *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("detecting duplicates: %w", err)
 		}
-	} else {
+
+	default:
 		allGroups = mtimeGroups
 	}
 

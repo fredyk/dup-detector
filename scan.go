@@ -22,7 +22,10 @@ type ScannedFile struct {
 // used to skip hardlinks pointing at an already-seen inode — deleting those
 // wouldn't reclaim space. Pass the same map across multiple Scan calls to
 // also catch cross-directory hardlinks.
-func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint64]string) ([]ScannedFile, error) {
+// onFile, if non-nil, is invoked for every accepted regular file as it is
+// discovered during the walk. It enables progressive work (e.g. streaming MD5
+// hashing) to overlap with the directory traversal.
+func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint64]string, onFile func(ScannedFile)) ([]ScannedFile, error) {
 	var files []ScannedFile
 	var count int
 	var hardlinkCount int
@@ -144,13 +147,17 @@ func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint
 			return nil
 		}
 
-		files = append(files, ScannedFile{
+		sf := ScannedFile{
 			Path:    path,
 			RelPath: relPath,
 			Size:    size,
 			ModTime: info.ModTime().Unix(),
 			Inode:   inode,
-		})
+		}
+		files = append(files, sf)
+		if onFile != nil {
+			onFile(sf)
+		}
 
 		count++
 		if cfg.Progress && count%500 == 0 {
