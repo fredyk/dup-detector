@@ -46,9 +46,13 @@ func NewTreeDupState() *TreeDupState {
 	}
 }
 
+// DirLookup returns all files under dir/ (backed by either a sorted slice or a
+// FileStore prefix query). Replaces threading the full []ScannedFile around.
+type DirLookup func(dir string) []ScannedFile
+
 // AddGroups ingests new dup groups and returns any newly discovered tree dup pairs.
-// allFiles must be sorted by Path (call SortFilesByPath first).
-func (s *TreeDupState) AddGroups(newGroups []DupGroup, allFiles []ScannedFile, verified bool) []TreeDupPair {
+// lookup resolves files-under-dir (slice- or store-backed).
+func (s *TreeDupState) AddGroups(newGroups []DupGroup, lookup DirLookup, verified bool) []TreeDupPair {
 	if len(newGroups) == 0 {
 		return nil
 	}
@@ -105,8 +109,8 @@ func (s *TreeDupState) AddGroups(newGroups []DupGroup, allFiles []ScannedFile, v
 	results := make([]result, len(unchecked))
 
 	verifyPair := func(i int, dk dirKey) {
-		filesA := filesUnderDir(dk.a, allFiles)
-		filesB := filesUnderDir(dk.b, allFiles)
+		filesA := lookup(dk.a)
+		filesB := lookup(dk.b)
 		if len(filesA) == 0 || len(filesB) == 0 || len(filesA) != len(filesB) {
 			return
 		}
@@ -247,11 +251,17 @@ func (s *TreeDupState) newCandidatePairs(newGroups []DupGroup, onProgress func(d
 
 // ── Standalone FindTreeDups (used in non-progressive mode) ───────────────────
 
+// SliceLookup adapts a sorted []ScannedFile into a DirLookup (binary search).
+// allFiles must be sorted by Path.
+func SliceLookup(allFiles []ScannedFile) DirLookup {
+	return func(dir string) []ScannedFile { return filesUnderDir(dir, allFiles) }
+}
+
 // FindTreeDups finds all tree dup pairs in one shot.
 // allFiles must be sorted by Path.
 func FindTreeDups(groups []DupGroup, allFiles []ScannedFile) []TreeDupPair {
 	state := NewTreeDupState()
-	return state.AddGroups(groups, allFiles, false)
+	return state.AddGroups(groups, SliceLookup(allFiles), false)
 }
 
 // FindTreeDupsByHash detects tree duplicates in O(N·depth) time using a

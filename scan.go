@@ -25,13 +25,28 @@ type ScannedFile struct {
 // onFile, if non-nil, is invoked for every accepted regular file as it is
 // discovered during the walk. It enables progressive work (e.g. streaming MD5
 // hashing) to overlap with the directory traversal.
-func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint64]string, onFile func(ScannedFile)) ([]ScannedFile, error) {
+func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint64]struct{}, onFile func(ScannedFile)) ([]ScannedFile, error) {
 	var files []ScannedFile
+	err := scanWalk(root, cfg, absExcludes, seenInodes, func(sf ScannedFile) error {
+		files = append(files, sf)
+		if onFile != nil {
+			onFile(sf)
+		}
+		return nil
+	})
+	return files, err
+}
+
+// scanWalk performs the directory traversal and calls emit for every accepted
+// regular file. Both Scan (slice) and ScanToStore (SQLite) build on it so the
+// filtering, hardlink-skipping and min/max-size logic stays in one place. If
+// emit returns an error the walk aborts with it.
+func scanWalk(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint64]struct{}, emit func(ScannedFile) error) error {
 	var count int
 	var hardlinkCount int
 
 	if seenInodes == nil {
-		seenInodes = make(map[[2]uint64]string)
+		seenInodes = make(map[[2]uint64]struct{})
 	}
 
 	normExcludes := make([]string, len(absExcludes))
@@ -128,14 +143,17 @@ func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint
 		var inode int64
 		if key, ok := inodeKey(info); ok {
 			inode = int64(key[1])
-			if prev, exists := seenInodes[key]; exists {
+			// Store only the key (struct{}), not the path: at 10M+ files keeping a
+			// path string per inode was the last O(files) RAM term (~2 GB). The
+			// verbose message loses the "→ first path" detail; the dedup is identical.
+			if _, exists := seenInodes[key]; exists {
 				hardlinkCount++
 				if cfg.Verbose {
-					fmt.Fprintf(os.Stderr, "  hardlink: %s → %s (skipped)\n", path, prev)
+					fmt.Fprintf(os.Stderr, "  hardlink: %s (skipped, same inode as earlier file)\n", path)
 				}
 				return nil
 			}
-			seenInodes[key] = path
+			seenInodes[key] = struct{}{}
 		}
 
 		size := info.Size()
@@ -154,9 +172,8 @@ func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint
 			ModTime: info.ModTime().Unix(),
 			Inode:   inode,
 		}
-		files = append(files, sf)
-		if onFile != nil {
-			onFile(sf)
+		if err := emit(sf); err != nil {
+			return err
 		}
 
 		count++
@@ -174,5 +191,5 @@ func Scan(root string, cfg *Config, absExcludes []string, seenInodes map[[2]uint
 		fmt.Fprintf(os.Stderr, "  skipped %d hardlink(s) to previously-seen inodes\n", hardlinkCount)
 	}
 
-	return files, err
+	return err
 }

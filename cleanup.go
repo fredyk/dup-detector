@@ -50,7 +50,7 @@ func (a *cleanupAction) items() []string {
 // InteractiveDelete presents all tree + file-level dup actions in a single
 // merged queue sorted by reclaimable bytes descending, with a uniform
 // numeric prompt shared by both kinds.
-func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []ScannedFile, cfg *Config) error {
+func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, lookup DirLookup, cfg *Config) error {
 	if len(treePairs) == 0 && len(groups) == 0 {
 		return nil
 	}
@@ -108,7 +108,7 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []Sc
 		// in this loop may have removed files that also belong here).
 		switch a.kind {
 		case actionTree:
-			if dirFullyDeleted(a.tree.DirA, allFiles, deleted) || dirFullyDeleted(a.tree.DirB, allFiles, deleted) {
+			if dirFullyDeleted(a.tree.DirA, lookup, deleted) || dirFullyDeleted(a.tree.DirB, lookup, deleted) {
 				skipped++
 				continue
 			}
@@ -127,11 +127,11 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []Sc
 		}
 
 		if autoMode {
-			applyAuto(a, allFiles, deleted, cfg)
+			applyAuto(a, lookup, deleted, cfg)
 			continue
 		}
 
-		stop := promptAction(i+1, len(actions), a, allFiles, reader, deleted, cfg, &autoMode)
+		stop := promptAction(i+1, len(actions), a, lookup, reader, deleted, cfg, &autoMode)
 		if stop {
 			break
 		}
@@ -146,7 +146,7 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, allFiles []Sc
 
 // promptAction renders one action and handles user input. Returns true if the
 // user requested to quit.
-func promptAction(idx, total int, a *cleanupAction, allFiles []ScannedFile, reader *bufio.Reader, deleted map[string]bool, cfg *Config, autoMode *bool) bool {
+func promptAction(idx, total int, a *cleanupAction, lookup DirLookup, reader *bufio.Reader, deleted map[string]bool, cfg *Config, autoMode *bool) bool {
 	items := a.items()
 	kindLabel := "file group"
 	if a.kind == actionTree {
@@ -182,7 +182,7 @@ func promptAction(idx, total int, a *cleanupAction, allFiles []ScannedFile, read
 			return true
 		case "a":
 			*autoMode = true
-			applyAuto(a, allFiles, deleted, cfg)
+			applyAuto(a, lookup, deleted, cfg)
 			return false
 		default:
 			indices, ok := parseIndices(line, len(items))
@@ -203,7 +203,7 @@ func promptAction(idx, total int, a *cleanupAction, allFiles []ScannedFile, read
 			if strings.ToLower(strings.TrimSpace(confirm)) == "n" {
 				continue
 			}
-			applyIndices(a, indices, allFiles, deleted, cfg)
+			applyIndices(a, indices, lookup, deleted, cfg)
 			return false
 		}
 	}
@@ -211,7 +211,7 @@ func promptAction(idx, total int, a *cleanupAction, allFiles []ScannedFile, read
 
 // applyAuto keeps index [0] and deletes the rest (for trees, index [0] is
 // the less-frequent cadence when cadence reordering applied).
-func applyAuto(a *cleanupAction, allFiles []ScannedFile, deleted map[string]bool, cfg *Config) {
+func applyAuto(a *cleanupAction, lookup DirLookup, deleted map[string]bool, cfg *Config) {
 	n := 2
 	if a.kind == actionFileGroup {
 		n = len(a.group.Files)
@@ -223,16 +223,16 @@ func applyAuto(a *cleanupAction, allFiles []ScannedFile, deleted map[string]bool
 	for i := 1; i < n; i++ {
 		rest = append(rest, i)
 	}
-	applyIndices(a, rest, allFiles, deleted, cfg)
+	applyIndices(a, rest, lookup, deleted, cfg)
 }
 
 // applyIndices runs the actual deletions for the selected 0-based indices.
-func applyIndices(a *cleanupAction, indices []int, allFiles []ScannedFile, deleted map[string]bool, cfg *Config) {
+func applyIndices(a *cleanupAction, indices []int, lookup DirLookup, deleted map[string]bool, cfg *Config) {
 	switch a.kind {
 	case actionTree:
 		items := a.items()
 		for _, j := range indices {
-			deleteTree(items[j], allFiles, deleted, cfg)
+			deleteTree(items[j], lookup, deleted, cfg)
 		}
 	case actionFileGroup:
 		for _, j := range indices {
@@ -261,8 +261,8 @@ func printActionHelp() {
 
 // ── Deletion primitives ─────────────────────────────────────────────────────
 
-func deleteTree(dir string, allFiles []ScannedFile, deleted map[string]bool, cfg *Config) {
-	files := filesUnderDir(dir, allFiles)
+func deleteTree(dir string, lookup DirLookup, deleted map[string]bool, cfg *Config) {
+	files := lookup(dir)
 	var removed int
 	for _, f := range files {
 		if deleted[f.Path] {
@@ -363,8 +363,8 @@ func parseIndices(input string, max int) ([]int, bool) {
 }
 
 // dirFullyDeleted returns true if every file under dir has been removed.
-func dirFullyDeleted(dir string, allFiles []ScannedFile, deleted map[string]bool) bool {
-	files := filesUnderDir(dir, allFiles)
+func dirFullyDeleted(dir string, lookup DirLookup, deleted map[string]bool) bool {
+	files := lookup(dir)
 	if len(files) == 0 {
 		return false
 	}

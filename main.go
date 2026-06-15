@@ -208,7 +208,7 @@ func run(_ *cobra.Command, args []string) error {
 
 	// Shared inode map: also catches hardlinks pointing to the same inode
 	// across DIR_A and DIR_B when they live on the same filesystem.
-	seenInodes := make(map[[2]uint64]string)
+	seenInodes := make(map[[2]uint64]struct{})
 
 	// In -c mode, open the MD5 cache up front so it can serve the progressive
 	// hasher during the walk. A nil cache (disabled / failed to open) just
@@ -239,44 +239,50 @@ func run(_ *cobra.Command, args []string) error {
 		}
 	}
 
-	// Progressive hashing: in -c mode, hash size-colliding files as the walk
-	// discovers them, overlapping MD5 I/O with the traversal. Disabled by
-	// --no-progressive (falls back to the post-walk ChecksumDups path).
-	var ph *ProgressiveHasher
-	var onFileA, onFileB func(ScannedFile)
-	if cfg.Checksum && !cfg.NoProgressive {
-		ph = NewProgressiveHasher(cache, cfg.Workers, twoDir)
-		onFileA = func(f ScannedFile) { ph.OnFile(f, 0) }
-		onFileB = func(f ScannedFile) { ph.OnFile(f, 1) }
+	// Stream the walk into an on-disk SQLite store instead of holding the full
+	// file list in RAM. Peak memory becomes O(working set) — one size group /
+	// the per-directory accumulator — not O(total files). The store lives next
+	// to the MD5 cache (a real disk), never /tmp (often tmpfs = RAM).
+	storeDir := filepath.Dir(DefaultCachePath())
+	if storeDir == "" || storeDir == "." {
+		storeDir = os.TempDir()
 	}
-
-	status("Scanning %s ...\n", dirA)
-	filesA, err := Scan(dirA, &cfg, excludeFromA, seenInodes, onFileA)
+	storePath := filepath.Join(storeDir, fmt.Sprintf("dup-detector-scan-%d.db", os.Getpid()))
+	store, err := NewFileStore(storePath)
 	if err != nil {
+		return fmt.Errorf("creating scan store: %w", err)
+	}
+	defer store.Close()
+
+	var nA, nB int
+	status("Scanning %s ...\n", dirA)
+	if err := ScanToStore(store, dirA, &cfg, excludeFromA, seenInodes, 0,
+		func(ScannedFile) { nA++ }); err != nil {
 		return fmt.Errorf("scanning %s: %w", dirA, err)
 	}
-
-	var filesB []ScannedFile
 	if twoDir {
 		status("Scanning %s ...\n", dirB)
-		filesB, err = Scan(dirB, &cfg, excludeFromB, seenInodes, onFileB)
-		if err != nil {
+		if err := ScanToStore(store, dirB, &cfg, excludeFromB, seenInodes, 1,
+			func(ScannedFile) { nB++ }); err != nil {
 			return fmt.Errorf("scanning %s: %w", dirB, err)
 		}
-		status("Found %d files in A, %d files in B\n", len(filesA), len(filesB))
+		status("Found %d files in A, %d files in B\n", nA, nB)
 	} else {
-		status("Found %d files\n", len(filesA))
+		status("Found %d files\n", nA)
 	}
 
-	// Merge and sort all files for tree dup analysis
-	allFiles := make([]ScannedFile, 0, len(filesA)+len(filesB))
-	allFiles = append(allFiles, filesA...)
-	allFiles = append(allFiles, filesB...)
-	SortFilesByPath(allFiles)
+	if err := store.Finalize(); err != nil {
+		return fmt.Errorf("indexing scan store: %w", err)
+	}
+
+	// Files-under-dir resolver backed by the store (indexed prefix range).
+	lookup := func(dir string) []ScannedFile {
+		files, _ := store.FilesUnderDir(dir)
+		return files
+	}
 
 	// ── Phase 1: fast tree detection via directory hashing ───────────────────
 	status("Detecting duplicates (fast pass)...\n")
-	mtimeGroups := MtimeDups(filesA, filesB)
 
 	treeState := NewTreeDupState()
 	treeState.Workers = cfg.Workers
@@ -288,30 +294,19 @@ func run(_ *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "\r  hashing dirs: %d / %d files  ", done, total)
 		}
 	}
-	earlyTrees := FindTreeDupsByHash(allFiles, hashProgressFn)
+	earlyTrees, err := FindTreeDupsByHashStore(store, &cfg, hashProgressFn)
+	if err != nil {
+		return fmt.Errorf("tree detection: %w", err)
+	}
 	if cfg.Progress {
 		fmt.Fprintln(os.Stderr)
 	}
-
-	// Register early trees. All tree dups (early + MD5-confirmed) are held
-	// and presented in the single interactive phase below, interleaved with
-	// file-level groups by reclaimable bytes — no upfront tree-vs-file
-	// heuristic, no streaming interruption during MD5.
 	treeState.Confirmed = append(treeState.Confirmed, earlyTrees...)
 
 	// ── Phase 2: MD5 (only if -c flag set) ───────────────────────────────────
-	switch {
-	case cfg.Checksum && ph != nil:
-		// Progressive: hashing overlapped the walk (and the tree pass above).
-		// Close drains the workers and returns the assembled groups.
-		status("Detecting duplicates (MD5 pass, progressive)...\n")
-		allGroups = ph.Close()
-		treeState.AddGroups(allGroups, allFiles, true)
-
-	case cfg.Checksum:
-		// Classic post-walk path (--no-progressive), processing largest-first.
+	if cfg.Checksum {
 		status("Detecting duplicates (MD5 pass, largest first)...\n")
-		err = ChecksumDups(filesA, filesB, twoDir, nil, cfg.Workers, cache,
+		err = ChecksumDupsStore(store, twoDir, nil, cfg.Workers, cache,
 			func(done, total int64) {
 				if cfg.Progress {
 					pct := int(100 * done / (total + 1))
@@ -323,7 +318,7 @@ func run(_ *cobra.Command, args []string) error {
 				allGroups = append(allGroups, newGroups...)
 				// Accumulate newly-confirmed tree dups silently; offering
 				// happens once at the end.
-				treeState.AddGroups(newGroups, allFiles, true)
+				treeState.AddGroups(newGroups, lookup, true)
 				return true
 			},
 		)
@@ -333,9 +328,12 @@ func run(_ *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("detecting duplicates: %w", err)
 		}
-
-	default:
-		allGroups = mtimeGroups
+	} else {
+		groups, gerr := MtimeDupsStore(store, twoDir)
+		if gerr != nil {
+			return fmt.Errorf("detecting duplicates: %w", gerr)
+		}
+		allGroups = groups
 	}
 
 	// ── Summary and output ────────────────────────────────────────────────────
@@ -366,7 +364,7 @@ func run(_ *cobra.Command, args []string) error {
 	}
 
 	if !cfg.DryRun {
-		if err := InteractiveDelete(treeState.Confirmed, allGroups, allFiles, &cfg); err != nil {
+		if err := InteractiveDelete(treeState.Confirmed, allGroups, lookup, &cfg); err != nil {
 			return err
 		}
 	}
