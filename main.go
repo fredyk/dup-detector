@@ -30,9 +30,6 @@ type Config struct {
 	Rehash    bool
 	CachePath string
 
-	// NoProgressive disables overlapping MD5 hashing with the walk (-c mode).
-	NoProgressive bool
-
 	// Output
 	Format string
 
@@ -112,8 +109,6 @@ func init() {
 		"ignore cached MD5s and recompute them (refreshes the cache)")
 	f.StringVar(&cfg.CachePath, "cache-path", "",
 		"path to the MD5 cache DB (default: ~/.cache/dup-detector/hashes.db)")
-	f.BoolVar(&cfg.NoProgressive, "no-progressive", false,
-		"in -c mode, hash files only after the full walk (don't overlap with it)")
 }
 
 func main() {
@@ -248,6 +243,7 @@ func run(_ *cobra.Command, args []string) error {
 		storeDir = os.TempDir()
 	}
 	storePath := filepath.Join(storeDir, fmt.Sprintf("dup-detector-scan-%d.db", os.Getpid()))
+	CleanStaleStores(storeDir) // sweep DBs orphaned by earlier killed runs
 	store, err := NewFileStore(storePath)
 	if err != nil {
 		return fmt.Errorf("creating scan store: %w", err)
@@ -300,6 +296,11 @@ func run(_ *cobra.Command, args []string) error {
 	}
 	if cfg.Progress {
 		fmt.Fprintln(os.Stderr)
+	}
+	if cfg.Checksum {
+		// Upgrade the fast mtime-based tree pairs to content-verified before they
+		// can ever be offered for deletion (size+mtime collide in backups).
+		earlyTrees = VerifyTreePairsByContent(earlyTrees, lookup, cache)
 	}
 	treeState.Confirmed = append(treeState.Confirmed, earlyTrees...)
 

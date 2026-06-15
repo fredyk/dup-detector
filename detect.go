@@ -190,34 +190,6 @@ func checksumGroup(candidates []ScannedFile, size int64, twoDir bool, workers in
 	return groups, nil
 }
 
-// DetectDups is the original all-at-once API (kept for compatibility).
-func DetectDups(filesA, filesB []ScannedFile, cfg *Config) ([]DupGroup, error) {
-	if !cfg.Checksum {
-		groups := MtimeDups(filesA, filesB)
-		return groups, nil
-	}
-	twoDir := len(filesB) > 0
-	var all []DupGroup
-	err := ChecksumDups(filesA, filesB, twoDir, nil, cfg.Workers, nil,
-		func(done, total int64) {
-			if cfg.Progress {
-				pct := int(100 * done / (total + 1))
-				fmt.Fprintf(os.Stderr, "\r  MD5: %d%%  (%s / %s)  ",
-					pct, FormatSize(done), FormatSize(total))
-			}
-		},
-		func(newGroups []DupGroup) bool {
-			all = append(all, newGroups...)
-			return true
-		},
-	)
-	if cfg.Progress {
-		fmt.Fprintln(os.Stderr)
-	}
-	sort.Slice(all, func(i, j int) bool { return all[i].Size > all[j].Size })
-	return all, err
-}
-
 func hasBothSides(files []ScannedFile) bool {
 	var hasA, hasB bool
 	for _, f := range files {

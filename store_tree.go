@@ -1,40 +1,37 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
 
-// dirHasOutOfWindowFile reports whether dir contains (recursively) any regular
-// file whose size falls outside [minSize, maxSize] (maxSize<=0 = no upper bound).
-// Such a file is invisible to a size-filtered scan, so a tree-dup claim over dir
-// would be unsound. Returns true on the first offender OR on any read error
-// (fail safe: if identity can't be guaranteed, don't confirm the tree).
-func dirHasOutOfWindowFile(dir string, minSize, maxSize int64) bool {
-	found := false
-	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+// dirStoreIncomplete reports whether the real directory on disk holds more
+// regular files than the store knows about — i.e. some were dropped by a filter
+// (--min/max-size, --exclude) or hardlink-skipped. When true the store's view of
+// the tree is incomplete, so a tree-dup claim would be unsound. Fail safe: any
+// read error returns true (reject). Filter-agnostic — it just counts.
+func dirStoreIncomplete(dir string, fs *FileStore) bool {
+	stored, err := fs.FilesUnderDir(dir)
+	if err != nil {
+		return true
+	}
+	real := 0
+	werr := filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
 		if err != nil {
-			found = true
-			return filepath.SkipAll
+			return err
 		}
-		if d.IsDir() || !d.Type().IsRegular() {
-			return nil
-		}
-		info, e := d.Info()
-		if e != nil {
-			found = true
-			return filepath.SkipAll
-		}
-		sz := info.Size()
-		if (minSize > 0 && sz < minSize) || (maxSize > 0 && sz > maxSize) {
-			found = true
-			return filepath.SkipAll
+		if !d.IsDir() && d.Type().IsRegular() {
+			real++
 		}
 		return nil
 	})
-	return found
+	if werr != nil {
+		return true
+	}
+	return real != len(stored)
 }
 
 // FindTreeDupsByHashStore is the store-backed FindTreeDupsByHash. It streams the
@@ -116,8 +113,14 @@ func FindTreeDupsByHashStore(fs *FileStore, cfg *Config, onProgress func(done, t
 	const minFileCount = 2
 
 	var pairs []TreeDupPair
+	skippedBuckets := 0
 	for k, dirs := range byKey {
-		if k.fileCount < minFileCount || len(dirs) < 2 || len(dirs) > maxDirsPerBucket {
+		if k.fileCount < minFileCount || len(dirs) < 2 {
+			continue
+		}
+		if len(dirs) > maxDirsPerBucket {
+			// Don't silently drop: too many identical dirs to pair (O(n²) guard).
+			skippedBuckets++
 			continue
 		}
 		sort.Strings(dirs)
@@ -136,6 +139,12 @@ func FindTreeDupsByHashStore(fs *FileStore, cfg *Config, onProgress func(done, t
 				})
 			}
 		}
+	}
+
+	if skippedBuckets > 0 && cfg != nil && !cfg.Quiet {
+		fmt.Fprintf(os.Stderr,
+			"  note: %d directory group(s) had >%d identical dirs and were skipped (pairing capped to avoid O(n²)); some tree dups may be unreported\n",
+			skippedBuckets, maxDirsPerBucket)
 	}
 
 	pairs = removeSubPairsFast(pairs)
@@ -157,18 +166,62 @@ func FindTreeDupsByHashStore(fs *FileStore, cfg *Config, onProgress func(done, t
 	return pairs, nil
 }
 
+// VerifyTreePairsByContent re-checks each tree pair by MD5. size+mtime can
+// collide — especially across backup rotations where rsync -a preserves mtime —
+// so the fast mtime-based tree pass is unsafe to act on. In -c mode this upgrades
+// those pairs to content-verified before they can be offered for deletion; pairs
+// whose files don't all hash-match are dropped. The cache memoizes the hashing
+// (and is shared with the file-level MD5 pass, so files aren't read twice).
+func VerifyTreePairsByContent(pairs []TreeDupPair, lookup DirLookup, cache *HashCache) []TreeDupPair {
+	out := pairs[:0]
+	for _, p := range pairs {
+		if treePairContentEqual(p, lookup, cache) {
+			p.Verified = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func treePairContentEqual(p TreeDupPair, lookup DirLookup, cache *HashCache) bool {
+	filesA := lookup(p.DirA)
+	filesB := lookup(p.DirB)
+	if len(filesA) == 0 || len(filesA) != len(filesB) {
+		return false
+	}
+	prefixA := p.DirA + string(filepath.Separator)
+	prefixB := p.DirB + string(filepath.Separator)
+	bMap := make(map[string]ScannedFile, len(filesB))
+	for _, f := range filesB {
+		bMap[f.Path[len(prefixB):]] = f
+	}
+	for _, fa := range filesA {
+		fb, ok := bMap[fa.Path[len(prefixA):]]
+		if !ok || fa.Size != fb.Size {
+			return false
+		}
+		ha, err := cache.Hash(fa)
+		if err != nil {
+			return false
+		}
+		hb, err := cache.Hash(fb)
+		if err != nil || ha != hb {
+			return false
+		}
+	}
+	return true
+}
+
 // verifyTreePairMtimeStore is the store-backed verifyTreePairMtime: it pulls each
 // dir's files with a prefix-range query instead of binary-searching a slice.
 func verifyTreePairMtimeStore(dirA, dirB string, fs *FileStore, cfg *Config) (bool, error) {
-	// Soundness guard for size-filtered scans: if --min-size/--max-size is active,
-	// files outside the window were never scanned, so the store's view of a dir is
-	// incomplete and a "tree dup" claim would be unsound (two dirs can match on
-	// their big files yet differ in small ones). Only confirm the pair if BOTH
-	// dirs contain exclusively in-window files on disk — i.e. the store sees the
-	// whole tree. Fail safe (reject) on any read error.
-	if cfg != nil && (cfg.MinSize > 0 || cfg.MaxSize > 0) {
-		if dirHasOutOfWindowFile(dirA, cfg.MinSize, cfg.MaxSize) ||
-			dirHasOutOfWindowFile(dirB, cfg.MinSize, cfg.MaxSize) {
+	// Soundness guard for filtered scans: when --min/max-size or --exclude/--include
+	// is active, files removed by the filter were never stored, so the store's view
+	// of a dir is incomplete and a "tree dup" claim would be unsound (two dirs can
+	// match on the visible files yet differ in the filtered ones). Confirm only if
+	// BOTH dirs are fully represented in the store. Fail safe (reject) on doubt.
+	if cfg != nil && (cfg.MinSize > 0 || cfg.MaxSize > 0 || len(cfg.Rules) > 0) {
+		if dirStoreIncomplete(dirA, fs) || dirStoreIncomplete(dirB, fs) {
 			return false, nil
 		}
 	}

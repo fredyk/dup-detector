@@ -33,33 +33,25 @@ de RSS y earlyoom lo mataba** ("Terminated"). pprof: 99% del heap = strings de r
 ---
 
 ## ✅ HECHO
-- [x] Refactor streaming SQLite (RAM 11.4 GB → ~650 MB).
-- [x] Guard de soundness para `--min-size`/`--max-size` en tree-dedup (`dirHasOutOfWindowFile`).
-- [x] #3 `temp_store(FILE)` — evita spike de RAM al crear el índice sobre 10M+ filas.
-- [x] #4 `seenInodes` aligerado a `map[inodo]struct{}` (era `→string`, ~2 GB; ahora ~200 MB).
+- [x] Refactor streaming SQLite (RAM 11.4 GB → ~650 MB). 12 tests verdes.
+- [x] Guard de soundness para `--min-size`/`--max-size` en tree-dedup.
+- [x] **#1** Tree-dups verificados por CONTENIDO (MD5) en `-c` antes de ofrecerlos para borrar
+  (`VerifyTreePairsByContent`; tests `content_test.go`). Resuelve el footgun de backups (mtime preservado).
+  Nota: en modo mtime (sin `-c`) los tree-dups siguen siendo size+mtime — es la elección explícita del usuario.
+- [x] **#2** Guard generalizado: `dirStoreIncomplete` compara nº de ficheros reales en disco vs los que el
+  store conoce bajo cada dir. Cubre min-size, max-size, `--exclude`/`--include` y hardlinks de un golpe.
+- [x] **#3** `temp_store(FILE)` — evita spike de RAM al crear el índice sobre 10M+ filas.
+- [x] **#4** `seenInodes` aligerado a `map[inodo]struct{}` (~2 GB → ~200 MB).
+- [x] **#7** Warning cuando `maxDirsPerBucket` descarta grupos de dirs (no silent caps).
+- [x] **#8** `progressive.go` y el flag `--no-progressive` ELIMINADOS (estaban muertos).
+- [x] **#9** `DetectDups` (muerto) eliminado. Las slice-versions (`MtimeDups`/`ChecksumDups`/
+  `FindTreeDupsByHash`) se MANTIENEN a propósito: son el oracle de los cross-check tests.
+- [x] **#10** `CleanStaleStores` barre `scan-<pid>.db` huérfanos de runs muertos al arrancar.
+- [x] **#11** Tras `Finalize` se sube `SetMaxOpenConns(NumCPU)` → lecturas concurrentes (verify paralelo).
 
-## ⏳ PENDIENTE (deuda de diseño, por prioridad)
-
-### 🔴 Tier 1 — Correctness (footguns de pérdida de datos)
-- [ ] **#1 Tree-dups confirmados por size+mtime, NO por contenido — incluso con `-c`.**
-  Los "early trees" (`FindTreeDupsByHash*`, `Verified=false`) entran a `Confirmed` y se ofrecen para
-  borrar sin checksum. Dos árboles mismo tamaño+mtime, contenido distinto → "idénticos" → pérdida.
-  Peligroso en backups (rsync `-a` preserva mtime). FIX: en `-c`, verificar pares de árbol por MD5
-  antes de ofrecerlos; o no ofrecer `Verified=false` para deleción (al menos warning rotundo).
-- [ ] **#2 El guard min-size NO cubre `--exclude`/`--include`.** Ficheros excluidos también invisibles
-  al store → misma unsoundness de tree-dedup. FIX: extender el chequeo o avisar.
-
-### 🟠 Tier 2 — Memoria (el RESULTADO aún en RAM)
-- [ ] **#5** `allGroups` + `dupIndex` (`map[ruta][]rutas`) + `TreeDupPair`s en RAM = O(dups).
-  Patológico con millones de duplicados. FIX: streamear/paginar output; dupIndex al store.
-- [ ] **#6** `accum`/`byKey` del tree-dedup = O(nº de directorios). Normalmente OK; documentar el límite.
-
-### 🟡 Tier 3 — Completeness (caps silenciosos)
-- [ ] **#7** `maxDirsPerBucket=2000`, `maxDirsPerGroup=50`, `depth=12` → pierde tree-dups SIN avisar.
-  FIX: warning al topar cualquier cap (regla "no silent caps").
-
-### ⚪ Tier 4 — Higiene / cabos sueltos
-- [ ] **#8** `progressive.go` quedó MUERTO + flag `--no-progressive` es no-op (engañoso). FIX: borrar fichero+flag, o reconectar progressive al store.
-- [ ] **#9** `DetectDups` + versiones slice (`MtimeDups`/`ChecksumDups`/`FindTreeDupsByHash`) solo las usan tests. Documentar como "test-only" o limpiar.
-- [ ] **#10** Fuga de `scan-<pid>.db` huérfanos si el proceso muere antes de `Close()`. FIX: barrer restos viejos al arrancar.
-- [ ] **#11** `FileStore` con `SetMaxOpenConns(1)` serializa el verify paralelo de `AddGroups`. Perf, no correctness. FIX: pool de conexiones read-only.
+## ⏳ PENDIENTE / ACEPTADO (deuda residual, baja prioridad)
+- [ ] **#5** `allGroups` + `dupIndex` + `TreeDupPair`s en RAM = O(dups). **ACEPTADO por ahora**: está
+  acotado por el TAMAÑO DEL RESULTADO, no por el input (12.8M ficheros con pocos dups → resultado pequeño).
+  Revisar solo si aparece un caso patológico (millones de grupos de duplicados). FIX futuro: streamear output.
+- [ ] **#6** `accum`/`byKey` del tree-dedup = O(nº de directorios). **ACEPTADO**: nº de dirs << nº de ficheros.
+  Documentado aquí por si un árbol con decenas de millones de dirs lo hiciera relevante.

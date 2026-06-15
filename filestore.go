@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	_ "modernc.org/sqlite"
 )
@@ -26,6 +27,31 @@ type FileStore struct {
 }
 
 const fsBatch = 50000 // rows per insert transaction
+
+// CleanStaleStores removes leftover scan DBs from earlier runs that died before
+// Close() (kill/OOM). A file dup-detector-scan-<pid>.db is stale iff <pid> is no
+// longer running. Best-effort; ignores errors.
+func CleanStaleStores(dir string) {
+	matches, _ := filepath.Glob(filepath.Join(dir, "dup-detector-scan-*.db"))
+	for _, m := range matches {
+		var pid int
+		if _, err := fmt.Sscanf(filepath.Base(m), "dup-detector-scan-%d.db", &pid); err != nil {
+			continue
+		}
+		if pid > 0 && processAlive(pid) {
+			continue // owned by a running scan
+		}
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			_ = os.Remove(m + suffix)
+		}
+	}
+}
+
+// processAlive reports whether pid is a live process (Linux /proc check).
+func processAlive(pid int) bool {
+	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	return err == nil
+}
 
 // NewFileStore creates a fresh scratch DB at path (removing any prior file).
 func NewFileStore(path string) (*FileStore, error) {
@@ -94,6 +120,9 @@ func (fs *FileStore) Finalize() error {
 	if _, err := fs.db.Exec(`CREATE INDEX idx_path ON files(path)`); err != nil {
 		return err
 	}
+	// Write phase is over (read-only from here): allow concurrent connections so
+	// parallel tree-pair verification isn't serialized on a single conn.
+	fs.db.SetMaxOpenConns(runtime.NumCPU())
 	return nil
 }
 
