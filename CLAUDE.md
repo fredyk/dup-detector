@@ -26,6 +26,9 @@ de RSS y earlyoom lo mataba** ("Terminated"). pprof: 99% del heap = strings de r
 ## Tests (red de seguridad — `go test`)
 10 tests: golden slice + cross-checks (store == slice) + guard min-size. TODOS verdes.
 
+## Workflow (regla del usuario)
+**SIEMPRE hacer `git push` a remoto tras commitear en este repo** (instrucción permanente de JFMV 2026-06-15). No preguntar.
+
 ## Binario / cache
 - `go install .` → `~/go/bin/dup-detector`.
 - Cache MD5: `~/.cache/dup-detector/` → symlink a `/media/fred/SHARED/dup-detector-cache` (NVMe, fuera de secure6).
