@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // HashCache memoizes file MD5s keyed by path, validated by (size, mtime, inode).
@@ -149,9 +149,9 @@ func OpenHashCache(path string, rehash bool) (*HashCache, error) {
 	// database property, so we set it once below (with retry) rather than in
 	// the DSN — only the first cold opener needs to switch it.
 	dsn := "file:" + path +
-		"?_pragma=busy_timeout(10000)" +
-		"&_pragma=synchronous(NORMAL)"
-	db, err := sql.Open("sqlite", dsn)
+		"?_busy_timeout=10000" +
+		"&_synchronous=NORMAL"
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err
 	}

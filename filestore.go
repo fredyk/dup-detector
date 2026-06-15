@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // FileStore is an on-disk SQLite table of scanned files. It replaces holding
@@ -61,8 +61,8 @@ func NewFileStore(path string) (*FileStore, error) {
 	// temp_store(FILE): the CREATE INDEX at Finalize sorts the whole table; with
 	// temp_store(MEMORY) that sort would spike RAM on a 10M+ row scan — exactly
 	// what this store exists to avoid. Keep temp on disk.
-	db, err := sql.Open("sqlite",
-		"file:"+path+"?_pragma=journal_mode(OFF)&_pragma=synchronous(OFF)&_pragma=temp_store(FILE)")
+	db, err := sql.Open("sqlite3",
+		"file:"+path+"?_journal_mode=OFF&_synchronous=OFF&_temp_store=FILE")
 	if err != nil {
 		return nil, err
 	}

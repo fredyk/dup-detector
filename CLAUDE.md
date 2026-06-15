@@ -61,6 +61,12 @@ de RSS y earlyoom lo mataba** ("Terminated"). pprof: 99% del heap = strings de r
   que NO exponía este leak. Para validar de verdad hay que dejar llegar a la fase MD5 con un grupo de
   tamaño grande.
 
+- [x] **#1** Driver SQLite: `modernc.org/sqlite` (Go puro) → **`mattn/go-sqlite3` (C-SQLite, CGo)** para
+  ops de BD más rápidas. DSN cambiado a sintaxis mattn (`?_busy_timeout=…&_journal_mode=…`). ⚠️ El build
+  ahora **necesita CGo** (gcc + libc) — se pierde el binario puro-Go. Verificado: abre la cache existente
+  (creada por modernc, en NTFS/SHARED) con WAL OK. Impacto real **modesto** (la BD no es el cuello de
+  botella; domina el I/O de disco), pero gratis una vez hecho.
+
 ## ⏳ PENDIENTE / ACEPTADO (deuda residual, baja prioridad)
 - [x] **#5 (re-diagnosticado con pprof — NO era el result-set)** El pico de RAM de la fase MD5 (heap 4.4GB,
   RSS ~10GB) era **`FileStore.FilesUnderDir` desde `AddGroups`**: materializaba TODOS los ficheros bajo cada
