@@ -153,20 +153,30 @@ func checksumGroup(candidates []ScannedFile, size int64, twoDir bool, workers in
 	}
 
 	results := make([]hashResult, len(candidates))
-	sem := make(chan struct{}, workers)
-	var wg sync.WaitGroup
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
 
-	for i, f := range candidates {
+	// Fixed worker pool: cap goroutines at `workers`, NOT one per file. A single
+	// size-collision group can hold millions of files; spawning a goroutine each
+	// piled up millions of ~2KB stacks → multi-GB RSS spike (pprof: 77k goroutines
+	// in checksumGroup on an 80k-file group). The pool keeps it O(workers).
+	jobs := make(chan int, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
-		i, f := i, f
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			hash, err := cache.Hash(f)
-			results[i] = hashResult{i, hash, err}
+			for i := range jobs {
+				hash, err := cache.Hash(candidates[i])
+				results[i] = hashResult{i, hash, err}
+			}
 		}()
 	}
+	for i := range candidates {
+		jobs <- i
+	}
+	close(jobs)
 	wg.Wait()
 
 	byHash := make(map[string][]ScannedFile)

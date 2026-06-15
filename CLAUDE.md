@@ -52,6 +52,15 @@ de RSS y earlyoom lo mataba** ("Terminated"). pprof: 99% del heap = strings de r
 - [x] **#10** `CleanStaleStores` barre `scan-<pid>.db` huérfanos de runs muertos al arrancar.
 - [x] **#11** Tras `Finalize` se sube `SetMaxOpenConns(NumCPU)` → lecturas concurrentes (verify paralelo).
 
+- [x] **#12 (CRÍTICO — hallado en run REAL con pprof)** `checksumGroup` lanzaba **1 goroutine por
+  fichero** del grupo de tamaño. Un grupo con millones de ficheros del mismo tamaño → millones de
+  goroutines × ~2KB stack = **~12 GB de RSS** (sawtooth de GC). pprof lo probó: **77.753 goroutines en
+  `checksumGroup.func1`** sobre un repro de 80k ficheros. FIX: **pool de workers fijo** (N goroutines
+  tirando de un canal) → goroutines O(workers). Tras el fix: 77.759 → 6 goroutines.
+  **LECCIÓN**: el benchmark de RAM previo usó `--no-progressive` y se mató ANTES de la fase MD5, así
+  que NO exponía este leak. Para validar de verdad hay que dejar llegar a la fase MD5 con un grupo de
+  tamaño grande.
+
 ## ⏳ PENDIENTE / ACEPTADO (deuda residual, baja prioridad)
 - [ ] **#5** `allGroups` + `dupIndex` + `TreeDupPair`s en RAM = O(dups). **ACEPTADO por ahora**: está
   acotado por el TAMAÑO DEL RESULTADO, no por el input (12.8M ficheros con pocos dups → resultado pequeño).
