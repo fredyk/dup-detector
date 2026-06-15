@@ -62,8 +62,11 @@ de RSS y earlyoom lo mataba** ("Terminated"). pprof: 99% del heap = strings de r
   tamaño grande.
 
 ## ⏳ PENDIENTE / ACEPTADO (deuda residual, baja prioridad)
-- [ ] **#5** `allGroups` + `dupIndex` + `TreeDupPair`s en RAM = O(dups). **ACEPTADO por ahora**: está
-  acotado por el TAMAÑO DEL RESULTADO, no por el input (12.8M ficheros con pocos dups → resultado pequeño).
-  Revisar solo si aparece un caso patológico (millones de grupos de duplicados). FIX futuro: streamear output.
+- [x] **#5 (re-diagnosticado con pprof — NO era el result-set)** El pico de RAM de la fase MD5 (heap 4.4GB,
+  RSS ~10GB) era **`FileStore.FilesUnderDir` desde `AddGroups`**: materializaba TODOS los ficheros bajo cada
+  dir candidato (strings de ruta) solo para comparar conteos; dirs de alto nivel = millones de ficheros →
+  slices multi-GB, y el verify paralelo retenía varios (mi #11 lo amplificó). FIX: `CountUnderDir` (COUNT
+  indexado por rango) + **count-first** en los dos paths de verify (`AddGroups` vía `DirCounter`, y
+  `verifyTreePairMtimeStore`/`dirStoreIncomplete`). ⏳ Re-validación a escala pendiente (disco ocupado con moves).
 - [ ] **#6** `accum`/`byKey` del tree-dedup = O(nº de directorios). **ACEPTADO**: nº de dirs << nº de ficheros.
   Documentado aquí por si un árbol con decenas de millones de dirs lo hiciera relevante.

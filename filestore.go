@@ -211,6 +211,19 @@ func (fs *FileStore) FilesUnderDir(dir string) ([]ScannedFile, error) {
 	return scanRows(rows)
 }
 
+// CountUnderDir returns how many files are under dir/ WITHOUT materializing them
+// (indexed COUNT over the prefix range). Tree-pair verification uses it to reject
+// mismatched candidates cheaply — materializing the full file list of a top-level
+// dir (millions of rows of path strings) was the MD5-phase RAM spike (pprof).
+func (fs *FileStore) CountUnderDir(dir string) (int, error) {
+	prefix := filepath.Clean(dir) + "/"
+	hi := prefix[:len(prefix)-1] + "0"
+	var n int
+	err := fs.db.QueryRow(
+		`SELECT count(*) FROM files WHERE path >= ? AND path < ?`, prefix, hi).Scan(&n)
+	return n, err
+}
+
 // Close drops the connection and deletes the scratch file.
 func (fs *FileStore) Close() error {
 	if fs.insert != nil {

@@ -27,7 +27,14 @@ type TreeDupState struct {
 	Confirmed    []TreeDupPair
 	Workers      int                   // parallel workers for pair verification (0 = NumCPU)
 	OnProgress   func(done, total int) // called after each verified pair; may be nil
+	// CountUnder, if set, returns the file count under a dir WITHOUT materializing
+	// the list (store-backed SQL COUNT). Used to reject mismatched candidate pairs
+	// cheaply before loading their (possibly millions of) files. nil → len(lookup).
+	CountUnder DirCounter
 }
+
+// DirCounter returns the number of files under dir/ cheaply (no materialization).
+type DirCounter func(dir string) int
 
 type dirKey struct{ a, b string } // a < b always (canonical form)
 
@@ -108,7 +115,22 @@ func (s *TreeDupState) AddGroups(newGroups []DupGroup, lookup DirLookup, verifie
 	}
 	results := make([]result, len(unchecked))
 
+	countUnder := func(dir string) int {
+		if s.CountUnder != nil {
+			return s.CountUnder(dir)
+		}
+		return len(lookup(dir))
+	}
+
 	verifyPair := func(i int, dk dirKey) {
+		// Cheap count check first: a tree-dup pair needs equal file counts. Reject
+		// mismatches here (indexed COUNT) without materializing the file lists —
+		// top-level candidate dirs can hold millions of files (pprof: this was the
+		// MD5-phase RAM spike via FilesUnderDir).
+		na := countUnder(dk.a)
+		if na == 0 || na != countUnder(dk.b) {
+			return
+		}
 		filesA := lookup(dk.a)
 		filesB := lookup(dk.b)
 		if len(filesA) == 0 || len(filesB) == 0 || len(filesA) != len(filesB) {

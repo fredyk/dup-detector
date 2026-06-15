@@ -282,6 +282,7 @@ func run(_ *cobra.Command, args []string) error {
 
 	treeState := NewTreeDupState()
 	treeState.Workers = cfg.Workers
+	treeState.CountUnder = func(d string) int { n, _ := store.CountUnderDir(d); return n }
 	var allGroups []DupGroup
 
 	var hashProgressFn func(done, total int)

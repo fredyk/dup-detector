@@ -14,7 +14,7 @@ import (
 // the tree is incomplete, so a tree-dup claim would be unsound. Fail safe: any
 // read error returns true (reject). Filter-agnostic — it just counts.
 func dirStoreIncomplete(dir string, fs *FileStore) bool {
-	stored, err := fs.FilesUnderDir(dir)
+	stored, err := fs.CountUnderDir(dir) // COUNT, not materialize
 	if err != nil {
 		return true
 	}
@@ -31,7 +31,7 @@ func dirStoreIncomplete(dir string, fs *FileStore) bool {
 	if werr != nil {
 		return true
 	}
-	return real != len(stored)
+	return real != stored
 }
 
 // FindTreeDupsByHashStore is the store-backed FindTreeDupsByHash. It streams the
@@ -224,6 +224,20 @@ func verifyTreePairMtimeStore(dirA, dirB string, fs *FileStore, cfg *Config) (bo
 		if dirStoreIncomplete(dirA, fs) || dirStoreIncomplete(dirB, fs) {
 			return false, nil
 		}
+	}
+
+	// Count-first: reject mismatched pairs without materializing huge dir lists.
+	na, err := fs.CountUnderDir(dirA)
+	if err != nil {
+		return false, err
+	}
+	if na == 0 {
+		return false, nil
+	}
+	if nb, err := fs.CountUnderDir(dirB); err != nil {
+		return false, err
+	} else if na != nb {
+		return false, nil
 	}
 
 	filesA, err := fs.FilesUnderDir(dirA)
