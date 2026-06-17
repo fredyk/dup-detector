@@ -44,6 +44,12 @@ type Config struct {
 
 var cfg Config
 
+// defaultExcludes are directory/file name patterns always skipped, regardless
+// of flags. `.flexiblefs` marks FlexibleFS metadata dirs whose contents are
+// internal bookkeeping, never user duplicates. A user can still re-include one
+// explicitly with `--include .flexiblefs` (last match wins, rsync semantics).
+var defaultExcludes = []string{".flexiblefs"}
+
 var rootCmd = &cobra.Command{
 	Use:   "dup-detector [OPTIONS] DIR_A [DIR_B]",
 	Short: "Detect duplicate files between or within directories",
@@ -129,6 +135,11 @@ func run(_ *cobra.Command, args []string) error {
 	}
 
 	// Build filter rules.
+	// Built-in excludes always come first so they form the base; a later
+	// --include can still override them (last match wins, rsync semantics).
+	for _, pat := range defaultExcludes {
+		cfg.Rules = append(cfg.Rules, FilterRule{Pattern: pat, Exclude: true})
+	}
 	// Includes are prepended so an explicit --include can override a later --exclude.
 	// Within each group, order is preserved (last match wins, rsync semantics).
 	for _, pat := range cfg.Includes {

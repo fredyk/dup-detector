@@ -29,6 +29,12 @@ de RSS y earlyoom lo mataba** ("Terminated"). pprof: 99% del heap = strings de r
 ## Workflow (regla del usuario)
 **SIEMPRE hacer `git push` a remoto tras commitear en este repo** (instrucción permanente de JFMV 2026-06-15). No preguntar.
 
+## Excludes por defecto (built-in)
+`defaultExcludes` en `main.go` lista nombres SIEMPRE ignorados, independientemente de flags.
+Actualmente: **`.flexiblefs`** (dirs de metadatos de FlexibleFS — bookkeeping interno, nunca
+duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, así que un
+`--include .flexiblefs` explícito puede re-incluirlos (last-match-wins, semántica rsync).
+
 ## Binario / cache
 - `go install .` → `~/go/bin/dup-detector`.
 - Cache MD5: `~/.cache/dup-detector/` → symlink a `/media/fred/SHARED/dup-detector-cache` (NVMe, fuera de secure6).
