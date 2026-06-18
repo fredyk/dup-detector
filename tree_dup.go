@@ -25,6 +25,14 @@ type TreeDupState struct {
 	dupIndex     map[string][]string // filePath → []duplicatePaths
 	checkedPairs map[dirKey]bool     // already verified (confirmed or rejected)
 	Confirmed    []TreeDupPair
+	// partnerOf is the persistent dominator index over every pair in Confirmed:
+	// for a confirmed pair (A,B) it holds A→B and B→A. AddGroups checks new pairs
+	// against it incrementally (O(depth) per pair) instead of rebuilding and
+	// re-sorting the whole Confirmed set every batch (which was O(batches·|Confirmed|),
+	// the real CPU hog found via pprof). INVARIANT: partnerOf carries exactly the
+	// partners of the pairs in Confirmed — every write to Confirmed must go through
+	// addConfirmed/AddConfirmed so the two stay in lockstep.
+	partnerOf    map[string][]string
 	Workers      int                   // parallel workers for pair verification (0 = NumCPU)
 	OnProgress   func(done, total int) // called after each verified pair; may be nil
 	// CountUnder, if set, returns the file count under a dir WITHOUT materializing
@@ -50,6 +58,24 @@ func NewTreeDupState() *TreeDupState {
 	return &TreeDupState{
 		dupIndex:     make(map[string][]string),
 		checkedPairs: make(map[dirKey]bool),
+		partnerOf:    make(map[string][]string),
+	}
+}
+
+// addConfirmed appends a pair to Confirmed and registers it in partnerOf so it
+// dominates deeper pairs discovered later. The sole writer of Confirmed.
+func (s *TreeDupState) addConfirmed(p TreeDupPair) {
+	s.Confirmed = append(s.Confirmed, p)
+	s.partnerOf[p.DirA] = append(s.partnerOf[p.DirA], p.DirB)
+	s.partnerOf[p.DirB] = append(s.partnerOf[p.DirB], p.DirA)
+}
+
+// AddConfirmed seeds the state with externally-discovered confirmed pairs (e.g.
+// the early mtime/content tree pass) so subsequent AddGroups calls treat them
+// as dominators. Pairs are assumed already de-duplicated among themselves.
+func (s *TreeDupState) AddConfirmed(pairs []TreeDupPair) {
+	for _, p := range pairs {
+		s.addConfirmed(p)
 	}
 }
 
@@ -210,16 +236,30 @@ func (s *TreeDupState) AddGroups(newGroups []DupGroup, lookup DirLookup, verifie
 		}
 	}
 
-	newPairs = removeSubPairsFrom(newPairs, s.Confirmed)
-	// Also remove sub-pairs within the new batch
-	newPairs = removeSubPairs(newPairs)
-
+	// Drop pairs dominated by an already-confirmed pair (the persistent partnerOf)
+	// or by a higher pair within this same batch — equivalent to the old
+	// removeSubPairsFrom(newPairs, Confirmed) + removeSubPairs(newPairs), but
+	// without rebuilding/re-sorting all of Confirmed each batch. Process
+	// shortest-path-first so a higher pair is registered before a deeper one is
+	// tested against it (a dominator's paths are prefixes ⇒ never longer).
 	sort.Slice(newPairs, func(i, j int) bool {
-		return newPairs[i].TotalSize > newPairs[j].TotalSize
+		return len(newPairs[i].DirA)+len(newPairs[i].DirB) < len(newPairs[j].DirA)+len(newPairs[j].DirB)
 	})
+	kept := newPairs[:0]
+	for _, p := range newPairs {
+		if treeDominated(s.partnerOf, p.DirA, p.DirB) {
+			continue
+		}
+		// Register immediately so later (longer) pairs in this batch see it.
+		s.addConfirmed(p)
+		kept = append(kept, p)
+	}
 
-	s.Confirmed = append(s.Confirmed, newPairs...)
-	return newPairs
+	// Return largest-first (Confirmed order is irrelevant; callers sort).
+	sort.Slice(kept, func(i, j int) bool {
+		return kept[i].TotalSize > kept[j].TotalSize
+	})
+	return kept
 }
 
 // maxDirsPerGroup caps the number of unique parent directories from a single
@@ -506,33 +546,39 @@ func removeSubPairs(pairs []TreeDupPair) []TreeDupPair {
 	return removeSubPairsFast(pairs)
 }
 
-// removeSubPairsFrom drops pairs that are sub-trees of anything in 'reference'.
-func removeSubPairsFrom(pairs []TreeDupPair, reference []TreeDupPair) []TreeDupPair {
-	if len(reference) == 0 {
-		return pairs
-	}
-	// Use the fast version when reference is large.
-	combined := removeSubPairsFast(append(append([]TreeDupPair(nil), reference...), pairs...))
-	// Return only pairs that survived and weren't already in reference.
-	refSet := make(map[[2]string]bool, len(reference))
-	for _, r := range reference {
-		a, b := r.DirA, r.DirB
-		if b < a {
-			a, b = b, a
+// treeDominated reports whether pair (a,b) is a sub-tree of some pair already
+// recorded in partnerOf: walk up from a (and, for the cross case, from b),
+// looking up each ancestor's partners, and check whether a partner is an
+// ancestor of b (resp. a). partnerOf[dir] lists the confirmed partner dirs of
+// dir — a confirmed pair (A,B) contributes A→B and B→A.
+func treeDominated(partnerOf map[string][]string, a, b string) bool {
+	wa := a
+	for wa != "" {
+		for _, pb := range partnerOf[wa] {
+			if pb == b || IsSubdir(pb, b) {
+				return true
+			}
 		}
-		refSet[[2]string{a, b}] = true
-	}
-	result := combined[:0]
-	for _, p := range combined {
-		a, b := p.DirA, p.DirB
-		if b < a {
-			a, b = b, a
+		sep := strings.LastIndexByte(wa, '/')
+		if sep <= 0 {
+			break
 		}
-		if !refSet[[2]string{a, b}] {
-			result = append(result, p)
-		}
+		wa = wa[:sep]
 	}
-	return result
+	wb := b
+	for wb != "" {
+		for _, pa := range partnerOf[wb] {
+			if pa == a || IsSubdir(pa, a) {
+				return true
+			}
+		}
+		sep := strings.LastIndexByte(wb, '/')
+		if sep <= 0 {
+			break
+		}
+		wb = wb[:sep]
+	}
+	return false
 }
 
 // removeSubPairsFast removes pairs dominated by higher-level pairs.
@@ -546,54 +592,15 @@ func removeSubPairsFast(pairs []TreeDupPair) []TreeDupPair {
 		return len(pairs[i].DirA)+len(pairs[i].DirB) < len(pairs[j].DirA)+len(pairs[j].DirB)
 	})
 
-	// partnerOf[dir] = list of confirmed partner dirs.
-	// When we confirm pair (A,B), we add A→B and B→A.
 	partnerOf := make(map[string][]string, len(pairs)/4)
-	addPartner := func(d, partner string) {
-		partnerOf[d] = append(partnerOf[d], partner)
-	}
-
-	// isDominated: walk up from a (and b for cross-case), look up partnerOf at each
-	// ancestor, and check if the partner is an ancestor of b (or a).
-	isDominated := func(a, b string) bool {
-		wa := a
-		for wa != "" {
-			for _, pb := range partnerOf[wa] {
-				if pb == b || IsSubdir(pb, b) {
-					return true
-				}
-			}
-			sep := strings.LastIndexByte(wa, '/')
-			if sep <= 0 {
-				break
-			}
-			wa = wa[:sep]
-		}
-		// Cross-case: walk up from b
-		wb := b
-		for wb != "" {
-			for _, pa := range partnerOf[wb] {
-				if pa == a || IsSubdir(pa, a) {
-					return true
-				}
-			}
-			sep := strings.LastIndexByte(wb, '/')
-			if sep <= 0 {
-				break
-			}
-			wb = wb[:sep]
-		}
-		return false
-	}
-
 	result := make([]TreeDupPair, 0, len(pairs)/4)
 	for _, p := range pairs {
-		if isDominated(p.DirA, p.DirB) {
+		if treeDominated(partnerOf, p.DirA, p.DirB) {
 			continue
 		}
 		result = append(result, p)
-		addPartner(p.DirA, p.DirB)
-		addPartner(p.DirB, p.DirA)
+		partnerOf[p.DirA] = append(partnerOf[p.DirA], p.DirB)
+		partnerOf[p.DirB] = append(partnerOf[p.DirB], p.DirA)
 	}
 	return result
 }

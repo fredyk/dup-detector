@@ -318,7 +318,7 @@ func run(_ *cobra.Command, args []string) error {
 		// can ever be offered for deletion (size+mtime collide in backups).
 		earlyTrees = VerifyTreePairsByContent(earlyTrees, lookup, cache)
 	}
-	treeState.Confirmed = append(treeState.Confirmed, earlyTrees...)
+	treeState.AddConfirmed(earlyTrees)
 
 	// ── Phase 2: MD5 (only if -c flag set) ───────────────────────────────────
 	if cfg.Checksum {
