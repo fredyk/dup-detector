@@ -324,6 +324,9 @@ func run(_ *cobra.Command, args []string) error {
 	treeState := NewTreeDupState()
 	treeState.Workers = cfg.Workers
 	treeState.CountUnder = func(d string) int { n, _ := store.CountUnderDir(d); return n }
+	treeState.CoverageCheck = func(dirA, dirB string, index map[string][]string) (bool, int64, error) {
+		return store.CoverageAndSize(dirA, dirB, index)
+	}
 	var allGroups []DupGroup
 
 	var hashProgressFn func(done, total int)

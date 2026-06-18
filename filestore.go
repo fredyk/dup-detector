@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -199,8 +200,6 @@ func (fs *FileStore) IterAllByPath(fn func(ScannedFile) error) error {
 // query, indexed on path). Mirrors the slice-based filesUnderDir.
 func (fs *FileStore) FilesUnderDir(dir string) ([]ScannedFile, error) {
 	prefix := filepath.Clean(dir) + "/"
-	// Upper bound: replace the trailing '/' (0x2F) with '0' (0x30) so the half-open
-	// range [prefix, hi) captures exactly the paths beginning with prefix.
 	hi := prefix[:len(prefix)-1] + "0"
 	rows, err := fs.db.Query(
 		`SELECT path,relpath,size,mtime,inode,source FROM files
@@ -209,6 +208,37 @@ func (fs *FileStore) FilesUnderDir(dir string) ([]ScannedFile, error) {
 		return nil, err
 	}
 	return scanRows(rows)
+}
+
+// prefixRange returns the half-open SQL range [dir/, dir0) for prefix queries.
+func prefixRange(dir string) (lo, hi string) {
+	lo = filepath.Clean(dir) + "/"
+	hi = lo[:len(lo)-1] + "0"
+	return
+}
+
+// StreamFilesUnderDir iterates through every file under dir/, calling fn for
+// each row one at a time. Returns early if fn returns false. Materializes
+// exactly one ScannedFile at a time (no full-slice allocation).
+func (fs *FileStore) StreamFilesUnderDir(dir string, fn func(ScannedFile) bool) error {
+	lo, hi := prefixRange(dir)
+	rows, err := fs.db.Query(
+		`SELECT path,relpath,size,mtime,inode,source FROM files
+		 WHERE path >= ? AND path < ? ORDER BY path`, lo, hi)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var f ScannedFile
+		if err := rows.Scan(&f.Path, &f.RelPath, &f.Size, &f.ModTime, &f.Inode, &f.Source); err != nil {
+			return err
+		}
+		if !fn(f) {
+			break
+		}
+	}
+	return rows.Err()
 }
 
 // CountUnderDir returns how many files are under dir/ WITHOUT materializing them
@@ -222,6 +252,36 @@ func (fs *FileStore) CountUnderDir(dir string) (int, error) {
 	err := fs.db.QueryRow(
 		`SELECT count(*) FROM files WHERE path >= ? AND path < ?`, prefix, hi).Scan(&n)
 	return n, err
+}
+
+// CoverageAndSize streams every file under dir and checks that each one has at
+// least one dupIndex member under targetDir. Accumulates total size of files
+// under dir. Streams without materializing the full list into a slice — avoids
+// the spike where FilesUnderDir loaded millions of path strings during
+// verifyPair/AddGroups (pprof: 2.4 GB RSS / 10.7 GB virtual).
+// Returns (covered, totalSize, error).
+func (fs *FileStore) CoverageAndSize(dir, targetDir string, index map[string][]string) (bool, int64, error) {
+	prefix := filepath.Clean(targetDir) + string(filepath.Separator)
+	var total int64
+	err := fs.StreamFilesUnderDir(dir, func(f ScannedFile) bool {
+		total += f.Size
+		dups, ok := index[f.Path]
+		if !ok {
+			return false
+		}
+		found := false
+		for _, dup := range dups {
+			if dup != f.Path && strings.HasPrefix(dup, prefix) {
+				found = true
+				break
+			}
+		}
+		return found
+	})
+	if err != nil {
+		return false, 0, err
+	}
+	return true, total, nil
 }
 
 // Close drops the connection and deletes the scratch file.

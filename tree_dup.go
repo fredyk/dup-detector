@@ -39,6 +39,11 @@ type TreeDupState struct {
 	// the list (store-backed SQL COUNT). Used to reject mismatched candidate pairs
 	// cheaply before loading their (possibly millions of) files. nil → len(lookup).
 	CountUnder DirCounter
+	// CoverageCheck, if set, streams the verification that every file under dirA
+	// has a dupIndex member under dirB (and vice versa), accumulating total size.
+	// Avoids materializing millions of paths into []ScannedFile. When nil, falls
+	// back to the materializing lookup + allCoveredByIndex path.
+	CoverageCheck func(dirA, dirB string, index map[string][]string) (bool, int64, error)
 }
 
 // DirCounter returns the number of files under dir/ cheaply (no materialization).
@@ -153,6 +158,25 @@ func (s *TreeDupState) AddGroups(newGroups []DupGroup, lookup DirLookup, verifie
 		// MD5-phase RAM spike via FilesUnderDir).
 		na := countUnder(dk.a)
 		if na == 0 || na != countUnder(dk.b) {
+			return
+		}
+		// Streaming coverage check: when available (store-backed), iterate each
+		// file under the dir one row at a time instead of loading all paths into
+		// a []ScannedFile slice. Avoids the 2.4 GB RSS / 10.7 GB virtual spike
+		// from FilesUnderDir on large dirs (pprof: issue #16).
+		if s.CoverageCheck != nil {
+			ok, totalSize, err := s.CoverageCheck(dk.a, dk.b, s.dupIndex)
+			if err != nil || !ok {
+				return
+			}
+			ok, _, err = s.CoverageCheck(dk.b, dk.a, s.dupIndex)
+			if err != nil || !ok {
+				return
+			}
+			results[i] = result{TreeDupPair{
+				DirA: dk.a, DirB: dk.b,
+				FileCount: na, TotalSize: totalSize, Verified: verified,
+			}, true}
 			return
 		}
 		filesA := lookup(dk.a)
