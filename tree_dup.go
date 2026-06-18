@@ -90,21 +90,19 @@ func (s *TreeDupState) AddGroups(newGroups []DupGroup, lookup DirLookup, verifie
 		return nil
 	}
 
-	// Update dup index with new groups
+	// Update dup index with new groups.
+	// Use one shared members slice per group (O(k) instead of O(k²) per group):
+	// every file in the group gets a reference to the same k-length slice. The
+	// slice includes f itself; allCoveredByIndex skips the self entry so coverage
+	// still requires a *different* group member under the target dir (preserving
+	// the pre-optimization semantics for nested candidate dir pairs).
 	for _, g := range newGroups {
-		paths := make([]string, len(g.Files))
+		members := make([]string, len(g.Files))
 		for i, f := range g.Files {
-			paths[i] = f.Path
+			members[i] = f.Path
 		}
 		for _, f := range g.Files {
-			dups := make([]string, 0, len(paths)-1)
-			for _, p := range paths {
-				if p != f.Path {
-					dups = append(dups, p)
-				}
-			}
-			// Merge with existing dups (earlier rounds may have added some)
-			s.dupIndex[f.Path] = mergeDedupe(s.dupIndex[f.Path], dups)
+			s.dupIndex[f.Path] = members // shared slice, O(1) per file
 		}
 	}
 
@@ -528,6 +526,13 @@ func allCoveredByIndex(files []ScannedFile, dir string, index map[string][]strin
 	for _, f := range files {
 		found := false
 		for _, dup := range index[f.Path] {
+			// dupIndex now stores the file's whole group (shared slice), so it
+			// includes f itself; skip it. Coverage requires a *different* file
+			// under dir — without this, a nested candidate pair (dir an ancestor
+			// of f's dir) would match f against itself and falsely "cover" it.
+			if dup == f.Path {
+				continue
+			}
 			if strings.HasPrefix(dup, prefix) {
 				found = true
 				break
@@ -605,17 +610,4 @@ func removeSubPairsFast(pairs []TreeDupPair) []TreeDupPair {
 	return result
 }
 
-func mergeDedupe(a, b []string) []string {
-	seen := make(map[string]bool, len(a)+len(b))
-	for _, s := range a {
-		seen[s] = true
-	}
-	result := append([]string(nil), a...)
-	for _, s := range b {
-		if !seen[s] {
-			seen[s] = true
-			result = append(result, s)
-		}
-	}
-	return result
-}
+

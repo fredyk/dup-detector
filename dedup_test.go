@@ -1,10 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"testing"
+	"unsafe"
 )
 
 // ── fixture helpers ───────────────────────────────────────────────────────────
@@ -134,6 +136,48 @@ func TestFindTreeDupsByHashFindsIdenticalSubtree(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected tree dup pair tree/ <-> tree2/, got %d pairs: %+v", len(pairs), pairs)
+	}
+}
+
+// TestDupIndexMemoryLinear proves the fix: a dup group with k identical files
+// stores O(k) strings in dupIndex (shared slice), not O(k²).
+func TestDupIndexMemoryLinear(t *testing.T) {
+	const k = 2000
+	base := t.TempDir()
+	files := make([]ScannedFile, k)
+	for i := range files {
+		files[i] = ScannedFile{Path: base + fmt.Sprintf("/dir/file_%d", i), Size: 100}
+	}
+	groups := []DupGroup{{Files: files}}
+	state := NewTreeDupState()
+	state.AddGroups(groups, func(string) []ScannedFile { return nil }, false)
+
+	// Count strings stored (unique backing arrays, not map entries)
+	var totalStrings int
+	seenCaps := make(map[uintptr]int)
+	for _, list := range state.dupIndex {
+		if len(list) > 0 {
+			ptr := uintptr(unsafe.Pointer(&list[0]))
+			seenCaps[ptr] = cap(list)
+		}
+	}
+	for _, c := range seenCaps {
+		totalStrings += c
+	}
+	// Shared slice: one slice of k → totalStrings = k.
+	// Old O(k²): k slices of (k-1) → totalStrings = k·(k-1) = ~4M.
+	if totalStrings < k || totalStrings > k*2 {
+		t.Fatalf("dupIndex stores ~%d strings for k=%d; expected O(k) ≈ %d", totalStrings, k, k)
+	}
+	// Verify every file maps to the same shared slice
+	first := state.dupIndex[files[0].Path]
+	for _, f := range files {
+		if state.dupIndex[f.Path] == nil {
+			t.Fatalf("file %s missing from dupIndex", f.Path)
+		}
+		if &state.dupIndex[f.Path][0] != &first[0] {
+			t.Fatalf("file %s has a different backing array — shared-slice invariant broken", f.Path)
+		}
 	}
 }
 

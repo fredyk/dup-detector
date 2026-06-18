@@ -2,6 +2,28 @@ package main
 
 import "testing"
 
+// TestAllCoveredByIndexSkipsSelf locks the self-exclusion in allCoveredByIndex.
+// dupIndex now stores each file's whole group as a shared slice (O(k) memory),
+// which includes the file itself. A file must NOT be treated as "covered" by its
+// own presence under dir — coverage requires a *different* group member. Without
+// the skip, a nested candidate pair (dir an ancestor of the file's dir) would
+// falsely confirm, risking deletion of non-duplicate trees.
+func TestAllCoveredByIndexSkipsSelf(t *testing.T) {
+	files := []ScannedFile{{Path: "/a/sub/x"}}
+
+	// Only member under /a/sub is the file itself → NOT covered.
+	idxSelfOnly := map[string][]string{"/a/sub/x": {"/a/sub/x"}}
+	if allCoveredByIndex(files, "/a/sub", idxSelfOnly) {
+		t.Fatal("a file must not count as its own duplicate under dir")
+	}
+
+	// A genuine different duplicate under /a/sub → covered.
+	idxReal := map[string][]string{"/a/sub/x": {"/a/sub/x", "/a/sub/y"}}
+	if !allCoveredByIndex(files, "/a/sub", idxReal) {
+		t.Fatal("a distinct group member under dir should cover the file")
+	}
+}
+
 // buildNestedTreeFixture creates two byte-identical trees P and Q with a nested
 // structure, so tree-dup detection has both a top-level pair (P,Q) and nested
 // sub-pairs (P/common,Q/common), (P/sub,Q/sub) where the top pair dominates.
