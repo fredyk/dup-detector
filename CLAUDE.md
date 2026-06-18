@@ -36,8 +36,12 @@ duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, as�
 `--include .flexiblefs` explícito puede re-incluirlos (last-match-wins, semántica rsync).
 
 ## Binario / cache
-- `go install .` → `~/go/bin/dup-detector`.
-- Cache MD5: `~/.cache/dup-detector/` → symlink a `/media/fred/SHARED/dup-detector-cache` (NVMe, fuera de secure6).
+- **Instalación: usar `./install.sh`** (build CGo + arregla shadows de PATH). OJO: `GOBIN=/unsafe/gopath/bin`
+  (política de storage de JFMV), que **no está en el PATH**; el binario que JFMV ejecuta es `/home/fred/go/bin/dup-detector`
+  (lo invoca por ruta completa con `sudo`). `go install .` a secas dejaría el build nuevo "escondido" en
+  `/unsafe/gopath/bin` mientras `~/go/bin/dup-detector` (viejo) lo eclipsa → `install.sh` symlinka el shadow
+  existente a la canónica para que `sudo /home/fred/go/bin/dup-detector` ejecute siempre el build fresco.
+- Cache MD5: `~/.cache/dup-detector/` → symlink a `/fastunsafe/dup-detector-cache` (NVMe rápido).
 
 ---
 
