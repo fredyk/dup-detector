@@ -212,6 +212,10 @@ func run(_ *cobra.Command, args []string) error {
 		}
 	}
 
+	// Live profiling endpoint (loopback-only, on by default). Lets a multi-hour
+	// run be profiled while it runs; see pprof.go / DUP_DETECTOR_PPROF.
+	startPprof(status)
+
 	// Shared inode map: also catches hardlinks pointing to the same inode
 	// across DIR_A and DIR_B when they live on the same filesystem.
 	seenInodes := make(map[[2]uint64]struct{})

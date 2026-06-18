@@ -14,12 +14,28 @@ rsync-like CLI tool to detect (and interactively delete) duplicate files between
 
 ## Install
 
+The SQLite driver is `mattn/go-sqlite3` (C-SQLite), so a C toolchain (gcc +
+libc headers) is required — CGo must be enabled.
+
 ```bash
 git clone <repo>
 cd dup-detector
-go build -o dup-detector .
-cp dup-detector ~/bin/
+./install.sh          # builds with CGO_ENABLED=1 and runs `go install .`
 ```
+
+## Profiling
+
+The binary serves `net/http/pprof` on `http://127.0.0.1:8158/debug/pprof/`
+(loopback-only, on by default), so a long run can be profiled while it runs:
+
+```bash
+go tool pprof http://127.0.0.1:8158/debug/pprof/profile?seconds=30   # CPU
+go tool pprof http://127.0.0.1:8158/debug/pprof/heap                 # RAM
+curl  http://127.0.0.1:8158/debug/pprof/goroutine?debug=2            # stacks
+```
+
+Override the address with `DUP_DETECTOR_PPROF=":6060"`, or disable with
+`DUP_DETECTOR_PPROF=off`.
 
 ## Usage
 
