@@ -100,7 +100,8 @@ duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, as�
   ancestros + gating de `checkedPairs`, un par alto `(P,Q)` propuesto en un batch temprano y rechazado por
   `dupIndex` incompleto NO se re-verifica luego → orden-dependiente (documentado en el test). ⏳ Re-validar en run
   real a escala (el run de 13h usaba binario viejo).
-- [ ] **#14 (feature pedida por JFMV) TTL de re-verificación de la cache MD5** Flag **`--cache-max-age`**
+- [ ] **#14 (feature pedida por JFMV — DIFERIDA a la semana del 2026-06-22 por presupuesto de tokens)** TTL de
+  re-verificación de la cache MD5. Flag **`--cache-max-age`**
   (duration, **default 14d**, **`0` = desactivado** = comportamiento actual: confiar para siempre). Semántica:
   en `cache.Hash`, un hit (`size+mtime+inode` iguales) solo se reusa si además `seen ≥ now − max-age`; si no,
   se re-hashea y se actualiza `seen`. La columna `seen` (`cache.go`) YA se escribe solo en `store()` (al
