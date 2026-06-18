@@ -104,7 +104,7 @@ duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, as�
   ancestros + gating de `checkedPairs`, un par alto `(P,Q)` propuesto en un batch temprano y rechazado por
   `dupIndex` incompleto NO se re-verifica luego → orden-dependiente (documentado en el test). ⏳ Re-validar en run
   real a escala (el run de 13h usaba binario viejo).
-- [ ] **#14 (feature pedida por JFMV — DIFERIDA a la semana del 2026-06-22 por presupuesto de tokens)** TTL de
+- [x] **#14 (feature pedida por JFMV)** TTL de
   re-verificación de la cache MD5. Flag **`--cache-max-age`**
   (duration, **default 14d**, **`0` = desactivado** = comportamiento actual: confiar para siempre). Semántica:
   en `cache.Hash`, un hit (`size+mtime+inode` iguales) solo se reusa si además `seen ≥ now − max-age`; si no,
@@ -114,8 +114,7 @@ duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, as�
   (`cache.go:177`) + condición de frescura en la rama de hit (`cache.go:218`). Sin migración (filas viejas ya
   tienen `seen`). VALOR: red de seguridad contra contenido que cambia SIN tocar size/mtime/inode (bit rot,
   mtime preservado por `rsync -a`/`touch -r`). Es estrictamente seguro (recalcular solo da un hash más fresco);
-  el coste es releer disco ≤1 vez por fichero cada `max-age`. NOTA medida (18/06): con 14d hoy NO cambia nada
-  (entrada más vieja de secure4 = 8 días); con 72h se re-hashearía ~50% (4.06M de 8.08M). ⏳ Sin implementar.
+  el coste es releer disco ≤1 vez por fichero cada `max-age`. ⏳ Implementado 2026-06-18.
 
 - [x] **#5 (re-diagnosticado con pprof — NO era el result-set)** El pico de RAM de la fase MD5 (heap 4.4GB,
   RSS ~10GB) era **`FileStore.FilesUnderDir` desde `AddGroups`**: materializaba TODOS los ficheros bajo cada

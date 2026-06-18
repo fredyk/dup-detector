@@ -34,8 +34,9 @@ type HashCache struct {
 	path   string
 	rehash bool
 	now    int64
+	maxAge int64 // seconds; 0 = trust cache forever
 
-	sel *sql.Stmt // SELECT md5,size,mtime,inode WHERE path=?
+	sel *sql.Stmt // SELECT md5,size,mtime,inode,seen WHERE path=?
 	ups *sql.Stmt // INSERT ... ON CONFLICT(path) DO UPDATE
 
 	wmu sync.Mutex // serialize this process's writes
@@ -138,7 +139,7 @@ func execRetry(db *sql.DB, query string) error {
 // path. rehash=true forces recomputation of all hashes (existing rows ignored
 // on lookup but still overwritten). The DSN sets WAL + busy_timeout on every
 // pooled connection so concurrent writers wait rather than error.
-func OpenHashCache(path string, rehash bool) (*HashCache, error) {
+func OpenHashCache(path string, rehash bool, maxAge time.Duration) (*HashCache, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
@@ -174,7 +175,7 @@ func OpenHashCache(path string, rehash bool) (*HashCache, error) {
 		return nil, err
 	}
 
-	sel, err := db.Prepare(`SELECT md5, size, mtime, inode FROM hashes WHERE path = ?`)
+	sel, err := db.Prepare(`SELECT md5, size, mtime, inode, seen FROM hashes WHERE path = ?`)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -190,11 +191,17 @@ func OpenHashCache(path string, rehash bool) (*HashCache, error) {
 		return nil, err
 	}
 
+	var maxAgeSec int64
+	if maxAge > 0 {
+		maxAgeSec = int64(maxAge.Seconds())
+	}
+
 	return &HashCache{
 		db:     db,
 		path:   path,
 		rehash: rehash,
 		now:    time.Now().Unix(),
+		maxAge: maxAgeSec,
 		sel:    sel,
 		ups:    ups,
 	}, nil
@@ -211,13 +218,17 @@ func (c *HashCache) Hash(f ScannedFile) (string, error) {
 
 	if !c.rehash {
 		var md5 string
-		var size, mtime, inode int64
-		err := c.sel.QueryRow(f.Path).Scan(&md5, &size, &mtime, &inode)
+		var size, mtime, inode, seen int64
+		err := c.sel.QueryRow(f.Path).Scan(&md5, &size, &mtime, &inode, &seen)
 		switch {
 		case err == nil:
 			if size == f.Size && mtime == f.ModTime && inode == f.Inode {
-				c.bump(&c.hits)
-				return md5, nil
+				// Metadata matches. If maxAge is set, also check freshness.
+				if c.maxAge == 0 || c.now-seen <= c.maxAge {
+					c.bump(&c.hits)
+					return md5, nil
+				}
+				// Stale by age — fall through to recompute.
 			}
 			// stale row — fall through to recompute and overwrite
 		case errors.Is(err, sql.ErrNoRows):

@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -26,9 +29,10 @@ type Config struct {
 	OneFileSystem bool
 
 	// Hash cache (only used in -c mode)
-	NoCache   bool
-	Rehash    bool
-	CachePath string
+	NoCache      bool
+	Rehash       bool
+	CachePath    string
+	CacheMaxAge  string
 
 	// Output
 	Format string
@@ -37,9 +41,10 @@ type Config struct {
 	Workers int
 
 	// Parsed values
-	MinSize int64
-	MaxSize int64
-	Rules   []FilterRule
+	MinSize        int64
+	MaxSize        int64
+	Rules          []FilterRule
+	CacheMaxAgeDur time.Duration
 }
 
 var cfg Config
@@ -115,6 +120,8 @@ func init() {
 		"ignore cached MD5s and recompute them (refreshes the cache)")
 	f.StringVar(&cfg.CachePath, "cache-path", "",
 		"path to the MD5 cache DB (default: ~/.cache/dup-detector/hashes.db)")
+	f.StringVar(&cfg.CacheMaxAge, "cache-max-age", "",
+		"re-hash files cached longer than DURATION (e.g. 72h, 14d); 0 or empty = trust cache forever (default)")
 }
 
 func main() {
@@ -132,6 +139,25 @@ func run(_ *cobra.Command, args []string) error {
 	}
 	if cfg.MaxSize, err = ParseSize(cfg.MaxSizeStr); err != nil {
 		return fmt.Errorf("--max-size: %w", err)
+	}
+
+	// Parse --cache-max-age duration
+	if cfg.CacheMaxAge != "" && cfg.CacheMaxAge != "0" {
+		dur, derr := time.ParseDuration(cfg.CacheMaxAge)
+		if derr != nil {
+			// Try suffixes: "d" for days
+			if strings.HasSuffix(cfg.CacheMaxAge, "d") {
+				n, nerr := strconv.Atoi(strings.TrimSuffix(cfg.CacheMaxAge, "d"))
+				if nerr == nil {
+					dur = time.Duration(n) * 24 * time.Hour
+					derr = nil
+				}
+			}
+			if derr != nil {
+				return fmt.Errorf("--cache-max-age: invalid duration %q: %w", cfg.CacheMaxAge, derr)
+			}
+		}
+		cfg.CacheMaxAgeDur = dur
 	}
 
 	// Build filter rules.
@@ -232,7 +258,7 @@ func run(_ *cobra.Command, args []string) error {
 		}
 		if cachePath == "" {
 			status("warning: cannot locate cache dir; running without MD5 cache\n")
-		} else if c, cerr := OpenHashCache(cachePath, cfg.Rehash); cerr != nil {
+		} else if c, cerr := OpenHashCache(cachePath, cfg.Rehash, cfg.CacheMaxAgeDur); cerr != nil {
 			status("warning: MD5 cache disabled (%v)\n", cerr)
 		} else {
 			cache = c
