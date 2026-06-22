@@ -21,6 +21,50 @@ func buildStore(t *testing.T, root string) *FileStore {
 	return fs
 }
 
+// TestCoverageAndSizeRejectsUncovered locks the #16 streaming coverage check:
+// a dir with a file that has NO duplicate under the target dir must report
+// covered=false. (The first cut of CoverageAndSize always returned true — the
+// closure's early-false only broke iteration without recording non-coverage —
+// which silently disabled tree-dup verification and could confirm non-duplicate
+// trees for deletion. This test exercises the store-backed path the unit tests
+// otherwise skip.)
+func TestCoverageAndSizeRejectsUncovered(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "X/a"), "shared-content")
+	writeFile(t, filepath.Join(root, "X/b"), "unique-to-X-content-longer")
+	writeFile(t, filepath.Join(root, "Y/a"), "shared-content")
+	fs := buildStore(t, root)
+	defer fs.Close()
+
+	xa := filepath.Join(root, "X", "a")
+	ya := filepath.Join(root, "Y", "a")
+	// dupIndex (as #15 builds it): shared group {X/a, Y/a}; X/b is unique → absent.
+	index := map[string][]string{xa: {xa, ya}, ya: {xa, ya}}
+	dirX := filepath.Join(root, "X")
+	dirY := filepath.Join(root, "Y")
+
+	// X is NOT fully covered by Y: X/b has no duplicate under Y.
+	covered, _, err := fs.CoverageAndSize(dirX, dirY, index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if covered {
+		t.Fatal("X must NOT be covered by Y (X/b has no duplicate under Y)")
+	}
+
+	// Y IS fully covered by X (Y/a's duplicate X/a lives under X).
+	covered, total, err := fs.CoverageAndSize(dirY, dirX, index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !covered {
+		t.Fatal("Y must be fully covered by X")
+	}
+	if total <= 0 {
+		t.Fatalf("expected positive total size for Y, got %d", total)
+	}
+}
+
 func TestFileStoreMatchesSlice(t *testing.T) {
 	root := buildFixture(t)
 	files := scanDir(t, root)

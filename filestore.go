@@ -263,25 +263,38 @@ func (fs *FileStore) CountUnderDir(dir string) (int, error) {
 func (fs *FileStore) CoverageAndSize(dir, targetDir string, index map[string][]string) (bool, int64, error) {
 	prefix := filepath.Clean(targetDir) + string(filepath.Separator)
 	var total int64
+	covered := true // stays true only if EVERY streamed file is covered
+	any := false
 	err := fs.StreamFilesUnderDir(dir, func(f ScannedFile) bool {
+		any = true
 		total += f.Size
 		dups, ok := index[f.Path]
 		if !ok {
-			return false
+			covered = false
+			return false // uncovered file: stop early, nothing more to learn
 		}
 		found := false
 		for _, dup := range dups {
+			// Skip self (dupIndex holds the file's whole group, #15) — coverage
+			// needs a *different* member under targetDir.
 			if dup != f.Path && strings.HasPrefix(dup, prefix) {
 				found = true
 				break
 			}
 		}
-		return found
+		if !found {
+			covered = false
+			return false
+		}
+		return true
 	})
 	if err != nil {
 		return false, 0, err
 	}
-	return true, total, nil
+	if !any {
+		return false, 0, nil // empty dir is not a tree-dup side (matches len==0 guard)
+	}
+	return covered, total, nil
 }
 
 // Close drops the connection and deletes the scratch file.
