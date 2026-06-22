@@ -18,14 +18,14 @@ func MtimeDupsStore(fs *FileStore, twoDir bool) ([]DupGroup, error) {
 		if err != nil {
 			return nil, err
 		}
-		if twoDir && !hasBothSides(candidates) {
+		if twoDir && !spansMultipleSources(candidates) {
 			continue
 		}
 		for _, g := range groupByMtime(candidates, size) {
 			if len(g.Files) < 2 {
 				continue
 			}
-			if twoDir && !hasBothSides(g.Files) {
+			if twoDir && !spansMultipleSources(g.Files) {
 				continue
 			}
 			groups = append(groups, g)
@@ -71,7 +71,7 @@ func ChecksumDupsStore(fs *FileStore, twoDir bool, skip map[string]bool, workers
 		}
 
 		doneBytes += size * int64(sc.Count)
-		if twoDir && !hasBothSides(candidates) {
+		if twoDir && !spansMultipleSources(candidates) {
 			if onProgress != nil {
 				onProgress(doneBytes, totalBytes)
 			}

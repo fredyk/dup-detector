@@ -63,14 +63,14 @@ func MtimeDups(filesA, filesB []ScannedFile) []DupGroup {
 	bySize := GroupBySize(all)
 	var groups []DupGroup
 	for size, candidates := range bySize {
-		if twoDir && !hasBothSides(candidates) {
+		if twoDir && !spansMultipleSources(candidates) {
 			continue
 		}
 		for _, g := range groupByMtime(candidates, size) {
 			if len(g.Files) < 2 {
 				continue
 			}
-			if twoDir && !hasBothSides(g.Files) {
+			if twoDir && !spansMultipleSources(g.Files) {
 				continue
 			}
 			groups = append(groups, g)
@@ -119,7 +119,7 @@ func ChecksumDups(filesA, filesB []ScannedFile, twoDir bool, skip map[string]boo
 
 	for _, size := range sizes {
 		candidates := bySize[size]
-		if twoDir && !hasBothSides(candidates) {
+		if twoDir && !spansMultipleSources(candidates) {
 			doneBytes += size * int64(len(candidates))
 			if onProgress != nil {
 				onProgress(doneBytes, totalBytes)
@@ -192,7 +192,7 @@ func checksumGroup(candidates []ScannedFile, size int64, twoDir bool, workers in
 		if len(fs) < 2 {
 			continue
 		}
-		if twoDir && !hasBothSides(fs) {
+		if twoDir && !spansMultipleSources(fs) {
 			continue
 		}
 		groups = append(groups, DupGroup{Size: size, Files: fs})
@@ -200,15 +200,19 @@ func checksumGroup(candidates []ScannedFile, size int64, twoDir bool, workers in
 	return groups, nil
 }
 
-func hasBothSides(files []ScannedFile) bool {
-	var hasA, hasB bool
-	for _, f := range files {
-		if f.Source == 0 {
-			hasA = true
-		} else {
-			hasB = true
-		}
-		if hasA && hasB {
+// spansMultipleSources reports whether files come from >=2 distinct roots
+// (Source values). Generalizes the old two-source "has both sides" check to N
+// roots: in cross-root mode we only surface dup groups that bridge different
+// roots. NOTE: the old version special-cased Source==0, which was WRONG for N
+// roots (a group entirely in roots 2 and 3 would be missed); this counts any
+// two distinct Source values.
+func spansMultipleSources(files []ScannedFile) bool {
+	if len(files) == 0 {
+		return false
+	}
+	first := files[0].Source
+	for _, f := range files[1:] {
+		if f.Source != first {
 			return true
 		}
 	}

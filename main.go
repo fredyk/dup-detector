@@ -28,6 +28,13 @@ type Config struct {
 	MaxSizeStr    string
 	OneFileSystem bool
 
+	// Roots beyond the 1-2 positional args. Repeatable; avoids error-prone extra
+	// positional arguments. The full root set = positional args + these.
+	AdditionalRoots []string
+	// WithinRoot: with >=2 roots, also report duplicates internal to a single
+	// root. Default (false) reports only duplicates that bridge >=2 roots.
+	WithinRoot bool
+
 	// Hash cache (only used in -c mode)
 	NoCache      bool
 	Rehash       bool
@@ -56,17 +63,22 @@ var cfg Config
 var defaultExcludes = []string{".flexiblefs"}
 
 var rootCmd = &cobra.Command{
-	Use:   "dup-detector [OPTIONS] DIR_A [DIR_B]",
+	Use:   "dup-detector [OPTIONS] DIR_A [DIR_B] [--additional-root DIR]...",
 	Short: "Detect duplicate files between or within directories",
 	Long: `Detect duplicate files.
 
 If only DIR_A is provided, finds duplicates within that directory.
 If DIR_A and DIR_B are provided, finds files whose content exists in both.
 
+To analyze MORE than two roots, add --additional-root DIR (repeatable) instead
+of extra positional args. With >=2 roots only cross-root duplicates are reported
+by default (use --within-root to also include duplicates internal to one root).
+The list of roots being analyzed is printed at startup.
+
 Directories are interchangeable - order does not affect the result.
 
-If one directory is a subdirectory of the other, it is automatically excluded
-from the parent scan to avoid false positives.
+If one root is a subdirectory of another, it is automatically excluded
+from the outer scan to avoid double-counting.
 
 Comparison modes:
   default   size + modification time (fast)
@@ -122,6 +134,10 @@ func init() {
 		"path to the MD5 cache DB (default: ~/.cache/dup-detector/hashes.db)")
 	f.StringVar(&cfg.CacheMaxAge, "cache-max-age", "",
 		"re-hash files cached longer than DURATION (e.g. 72h, 14d); 0 or empty = trust cache forever (default)")
+	f.StringArrayVar(&cfg.AdditionalRoots, "additional-root", nil,
+		"additional root directory to analyze (repeatable; use instead of extra positional args)")
+	f.BoolVar(&cfg.WithinRoot, "within-root", false,
+		"with >=2 roots, also report duplicates within a single root (default: only cross-root)")
 }
 
 func main() {
@@ -189,47 +205,50 @@ func run(_ *cobra.Command, args []string) error {
 		cfg.Rules = append(cfg.Rules, rules...)
 	}
 
-	// Resolve directories
-	dirA, err := filepath.Abs(args[0])
-	if err != nil {
-		return fmt.Errorf("resolving %s: %w", args[0], err)
+	// Resolve the set of roots: positional args (1-2) + --additional-root
+	// (repeatable, to avoid error-prone extra positional args). Normalize to
+	// absolute and dedupe.
+	rawRoots := append(append([]string{}, args...), cfg.AdditionalRoots...)
+	var roots []string
+	seenRoot := map[string]bool{}
+	for _, r := range rawRoots {
+		abs, aerr := filepath.Abs(r)
+		if aerr != nil {
+			return fmt.Errorf("resolving %s: %w", r, aerr)
+		}
+		if seenRoot[abs] {
+			if !cfg.Quiet {
+				fmt.Fprintf(os.Stderr, "note: duplicate root %s ignored\n", abs)
+			}
+			continue
+		}
+		seenRoot[abs] = true
+		roots = append(roots, abs)
+	}
+	if len(roots) == 0 {
+		return fmt.Errorf("no root directories to analyze")
 	}
 
-	twoDir := len(args) == 2
-	var dirB string
-	if twoDir {
-		dirB, err = filepath.Abs(args[1])
-		if err != nil {
-			return fmt.Errorf("resolving %s: %w", args[1], err)
-		}
-		if dirA == dirB {
-			twoDir = false
-			if !cfg.Quiet {
-				fmt.Fprintln(os.Stderr, "note: DIR_A and DIR_B are the same; running in single-dir mode")
+	// Per-root scan exclusions: when root j is nested inside root i, exclude j
+	// from i's scan so each file is attributed to exactly one root/source (the
+	// innermost), never double-counted under two sources.
+	rootExcludes := make([][]string, len(roots))
+	for i := range roots {
+		for j := range roots {
+			if i != j && IsSubdir(roots[i], roots[j]) {
+				rootExcludes[i] = append(rootExcludes[i], roots[j])
+				if !cfg.Quiet {
+					fmt.Fprintf(os.Stderr, "note: %s is inside %s; excluding it from the latter's scan\n",
+						roots[j], roots[i])
+				}
 			}
 		}
 	}
 
-	// Detect subdir relationships and set up per-scan exclusions
-	var excludeFromA, excludeFromB []string
-	if twoDir {
-		switch {
-		case IsSubdir(dirA, dirB):
-			// dirB is inside dirA → exclude dirB from A scan
-			excludeFromA = append(excludeFromA, dirB)
-			if !cfg.Quiet {
-				fmt.Fprintf(os.Stderr, "note: %s is inside %s; excluding it from A scan\n",
-					dirB, dirA)
-			}
-		case IsSubdir(dirB, dirA):
-			// dirA is inside dirB → exclude dirA from B scan
-			excludeFromB = append(excludeFromB, dirA)
-			if !cfg.Quiet {
-				fmt.Fprintf(os.Stderr, "note: %s is inside %s; excluding it from B scan\n",
-					dirA, dirB)
-			}
-		}
-	}
+	// crossRoot: with >=2 roots we surface only duplicates that bridge different
+	// roots (the point of comparing backups). --within-root disables the filter;
+	// a single root always reports all its internal duplicates.
+	crossRoot := len(roots) >= 2 && !cfg.WithinRoot
 
 	// Scan
 	status := func(format string, a ...any) {
@@ -291,22 +310,29 @@ func run(_ *cobra.Command, args []string) error {
 	}
 	defer store.Close()
 
-	var nA, nB int
-	status("Scanning %s ...\n", dirA)
-	if err := ScanToStore(store, dirA, &cfg, excludeFromA, seenInodes, 0,
-		func(ScannedFile) { nA++ }); err != nil {
-		return fmt.Errorf("scanning %s: %w", dirA, err)
+	// Announce the roots to analyze (requirement: print the root list at start).
+	status("Analyzing %d root(s):\n", len(roots))
+	for i, r := range roots {
+		status("  [%d] %s\n", i, r)
 	}
-	if twoDir {
-		status("Scanning %s ...\n", dirB)
-		if err := ScanToStore(store, dirB, &cfg, excludeFromB, seenInodes, 1,
-			func(ScannedFile) { nB++ }); err != nil {
-			return fmt.Errorf("scanning %s: %w", dirB, err)
+
+	counts := make([]int, len(roots))
+	for i, r := range roots {
+		idx := i // capture for the closure
+		status("Scanning %s ...\n", r)
+		if err := ScanToStore(store, r, &cfg, rootExcludes[idx], seenInodes, idx,
+			func(ScannedFile) { counts[idx]++ }); err != nil {
+			return fmt.Errorf("scanning %s: %w", r, err)
 		}
-		status("Found %d files in A, %d files in B\n", nA, nB)
-	} else {
-		status("Found %d files\n", nA)
 	}
+	var totalFiles int
+	for i, n := range counts {
+		totalFiles += n
+		if len(roots) > 1 {
+			status("  [%d] %s: %d file(s)\n", i, roots[i], n)
+		}
+	}
+	status("Found %d file(s) total\n", totalFiles)
 
 	if err := store.Finalize(); err != nil {
 		return fmt.Errorf("indexing scan store: %w", err)
@@ -352,7 +378,7 @@ func run(_ *cobra.Command, args []string) error {
 	// ── Phase 2: MD5 (only if -c flag set) ───────────────────────────────────
 	if cfg.Checksum {
 		status("Detecting duplicates (MD5 pass, largest first)...\n")
-		err = ChecksumDupsStore(store, twoDir, nil, cfg.Workers, cache,
+		err = ChecksumDupsStore(store, crossRoot, nil, cfg.Workers, cache,
 			func(done, total int64) {
 				if cfg.Progress {
 					pct := int(100 * done / (total + 1))
@@ -375,7 +401,7 @@ func run(_ *cobra.Command, args []string) error {
 			return fmt.Errorf("detecting duplicates: %w", err)
 		}
 	} else {
-		groups, gerr := MtimeDupsStore(store, twoDir)
+		groups, gerr := MtimeDupsStore(store, crossRoot)
 		if gerr != nil {
 			return fmt.Errorf("detecting duplicates: %w", gerr)
 		}
