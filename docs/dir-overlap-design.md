@@ -233,8 +233,11 @@ verificar el orden (un fichero en 3 roots: como mucho se borran 2 de 3 copias a 
    en backups). Borrar columna A elimina las copias de Ri del grupo, conserva las de Rj.
 4. **Granularidad**: `[A]/[B]/[f]` (sin selección de filas sueltas en v1; lo granular
    se hace con `[f]` fichero-por-fichero, no persistente).
-5. **Bloques ≤30** ordenados por Σ tamaños en la cola global (refinamiento #1). Troceado
-   por tamaño desc dentro del par de roots.
+5. **Bloques ≤30** ordenados por Σ tamaños en la cola global (refinamiento #1). ⭐ Los
+   ficheros compartidos de un par de roots se ordenan **por tamaño DESC** y se trocean en
+   bloques de 30 → **el bloque 1 contiene los 30 ficheros MÁS GRANDES**, el bloque 2 los
+   30 siguientes, etc. (refinamiento JFMV: "los 30 más grandes"). Así el primer bloque de
+   cada par es siempre el de mayor Σ tamaños y encabeza la cola por bytes.
 6. **`[f]`** explota solo ese bloque, no persiste (refinamiento #2).
 7. **Arranque**: imprimir lista numerada de roots a analizar.
 
