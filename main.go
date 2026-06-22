@@ -35,6 +35,11 @@ type Config struct {
 	// root. Default (false) reports only duplicates that bridge >=2 roots.
 	WithinRoot bool
 
+	// Partial directory-overlap blocks (>=2 roots).
+	NoOverlap        bool
+	OverlapBlockSize int
+	MinOverlap       int
+
 	// Hash cache (only used in -c mode)
 	NoCache      bool
 	Rehash       bool
@@ -138,6 +143,12 @@ func init() {
 		"additional root directory to analyze (repeatable; use instead of extra positional args)")
 	f.BoolVar(&cfg.WithinRoot, "within-root", false,
 		"with >=2 roots, also report duplicates within a single root (default: only cross-root)")
+	f.BoolVar(&cfg.NoOverlap, "no-overlap", false,
+		"don't group cross-root shared files into 2-column overlap blocks (show them one by one)")
+	f.IntVar(&cfg.OverlapBlockSize, "overlap-block-size", defaultOverlapBlockSize,
+		"max shared files shown per folder-overlap block (2-column view)")
+	f.IntVar(&cfg.MinOverlap, "min-overlap", defaultMinOverlap,
+		"min shared files between two roots to form a folder-overlap block")
 }
 
 func main() {
@@ -420,8 +431,18 @@ func run(_ *cobra.Command, args []string) error {
 	for _, g := range allGroups {
 		totalWasted += g.WastedBytes()
 	}
-	status("Found %d tree duplicate(s), %d file-level group(s), %s reclaimable\n\n",
-		len(finalTrees), len(allGroups), FormatSize(totalWasted))
+
+	// Group cross-root shared files into 2-column overlap blocks (>=2 roots).
+	// deleteGroups = the file groups NOT absorbed into a block; allGroups stays
+	// intact for the stdout report so no file silently disappears from it.
+	var overlapBlocks []dirOverlapBlock
+	deleteGroups := allGroups
+	if !cfg.NoOverlap && len(roots) >= 2 {
+		overlapBlocks, deleteGroups = BuildOverlapBlocks(allGroups, roots, cfg.OverlapBlockSize, cfg.MinOverlap)
+	}
+
+	status("Found %d tree duplicate(s), %d folder-overlap block(s), %d file-level group(s), %s reclaimable\n\n",
+		len(finalTrees), len(overlapBlocks), len(allGroups), FormatSize(totalWasted))
 
 	// Print results to stdout
 	if len(finalTrees) > 0 {
@@ -436,7 +457,7 @@ func run(_ *cobra.Command, args []string) error {
 	}
 
 	if !cfg.DryRun {
-		if err := InteractiveDelete(treeState.Confirmed, allGroups, lookup, &cfg); err != nil {
+		if err := InteractiveDelete(treeState.Confirmed, overlapBlocks, deleteGroups, lookup, &cfg); err != nil {
 			return err
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -17,6 +18,7 @@ type actionKind int
 const (
 	actionTree actionKind = iota
 	actionFileGroup
+	actionDirOverlap
 )
 
 // cleanupAction is a single interactive unit: either a tree dup pair or a
@@ -24,47 +26,69 @@ const (
 // and presented together with a uniform numeric prompt, so the user always
 // faces the biggest win next regardless of kind.
 type cleanupAction struct {
-	kind  actionKind
-	tree  TreeDupPair // valid when kind == actionTree
-	group DupGroup    // valid when kind == actionFileGroup
+	kind    actionKind
+	tree    TreeDupPair     // valid when kind == actionTree
+	group   DupGroup        // valid when kind == actionFileGroup
+	overlap dirOverlapBlock // valid when kind == actionDirOverlap
 }
 
 func (a *cleanupAction) waste() int64 {
-	if a.kind == actionTree {
+	switch a.kind {
+	case actionTree:
 		return a.tree.TotalSize
+	case actionDirOverlap:
+		return a.overlap.sharedBytes
+	default:
+		return a.group.WastedBytes()
 	}
-	return a.group.WastedBytes()
 }
 
 func (a *cleanupAction) items() []string {
-	if a.kind == actionTree {
+	switch a.kind {
+	case actionTree:
 		return []string{a.tree.DirA, a.tree.DirB}
+	case actionDirOverlap:
+		var paths []string
+		for _, f := range a.overlap.aSide() {
+			paths = append(paths, f.Path)
+		}
+		for _, f := range a.overlap.bSide() {
+			paths = append(paths, f.Path)
+		}
+		return paths
+	default:
+		paths := make([]string, len(a.group.Files))
+		for i, f := range a.group.Files {
+			paths[i] = f.Path
+		}
+		return paths
 	}
-	paths := make([]string, len(a.group.Files))
-	for i, f := range a.group.Files {
-		paths[i] = f.Path
-	}
-	return paths
 }
 
 // InteractiveDelete presents all tree + file-level dup actions in a single
 // merged queue sorted by reclaimable bytes descending, with a uniform
 // numeric prompt shared by both kinds.
-func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, lookup DirLookup, cfg *Config) error {
-	if len(treePairs) == 0 && len(groups) == 0 {
+func InteractiveDelete(treePairs []TreeDupPair, blocks []dirOverlapBlock, groups []DupGroup, lookup DirLookup, cfg *Config) error {
+	if len(treePairs) == 0 && len(blocks) == 0 && len(groups) == 0 {
 		return nil
 	}
 
-	// Orient so the less-frequent backup cadence sits at index [1] — auto
-	// mode preserves that slot in both kinds.
+	// Orient so the less-frequent backup cadence sits at the keep slot — auto
+	// mode preserves it across all kinds.
 	reorientPairsByBackupCadence(treePairs)
+	for i := range blocks {
+		reorientBlockByBackupCadence(&blocks[i])
+	}
 	for i := range groups {
 		reorientFilesByBackupCadence(groups[i].Files)
 	}
 
-	actions := make([]cleanupAction, 0, len(treePairs)+len(groups))
+	actions := make([]cleanupAction, 0, len(treePairs)+len(blocks)+len(groups))
 	for _, t := range treePairs {
 		actions = append(actions, cleanupAction{kind: actionTree, tree: t})
+	}
+	for _, b := range blocks {
+		actions = append(actions, cleanupAction{kind: actionDirOverlap, overlap: b})
 	}
 	for _, g := range groups {
 		actions = append(actions, cleanupAction{kind: actionFileGroup, group: g})
@@ -76,20 +100,24 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, lookup DirLoo
 	reader := bufio.NewReader(os.Stdin)
 	deleted := make(map[string]bool)
 
-	var treeWaste, fileWaste int64
-	var treeCount, fileCount int
+	var treeWaste, fileWaste, overlapWaste int64
+	var treeCount, fileCount, overlapCount int
 	for i := range actions {
-		if actions[i].kind == actionTree {
+		switch actions[i].kind {
+		case actionTree:
 			treeWaste += actions[i].waste()
 			treeCount++
-		} else {
+		case actionDirOverlap:
+			overlapWaste += actions[i].waste()
+			overlapCount++
+		default:
 			fileWaste += actions[i].waste()
 			fileCount++
 		}
 	}
 	fmt.Fprintf(os.Stderr,
-		"\n%d action(s) to review — %d tree(s) (%s) + %d file group(s) (%s). Sorted by reclaimable bytes desc.\n",
-		len(actions), treeCount, FormatSize(treeWaste), fileCount, FormatSize(fileWaste))
+		"\n%d action(s) to review — %d tree(s) (%s) + %d folder-overlap block(s) (%s) + %d file group(s) (%s). Sorted by reclaimable bytes desc.\n",
+		len(actions), treeCount, FormatSize(treeWaste), overlapCount, FormatSize(overlapWaste), fileCount, FormatSize(fileWaste))
 	fmt.Fprintln(os.Stderr, "(Tree and file-level totals may overlap when the same bytes appear in both.)")
 	fmt.Fprint(os.Stderr, "Proceed to interactive deletion? [y/N] ")
 	ans, _ := reader.ReadString('\n')
@@ -124,6 +152,24 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, lookup DirLoo
 				continue
 			}
 			a.group.Files = survivors
+		case actionDirOverlap:
+			// Keep only items that are still a live duplicate: both sides must
+			// still have at least one undeleted copy (a prior action may have
+			// removed one side already).
+			var live []overlapItem
+			var sb int64
+			for _, it := range a.overlap.items {
+				if anyAlive(it.aFiles, deleted) && anyAlive(it.bFiles, deleted) {
+					live = append(live, it)
+					sb += it.size
+				}
+			}
+			if len(live) == 0 {
+				skipped++
+				continue
+			}
+			a.overlap.items = live
+			a.overlap.sharedBytes = sb
 		}
 
 		if autoMode {
@@ -147,6 +193,9 @@ func InteractiveDelete(treePairs []TreeDupPair, groups []DupGroup, lookup DirLoo
 // promptAction renders one action and handles user input. Returns true if the
 // user requested to quit.
 func promptAction(idx, total int, a *cleanupAction, lookup DirLookup, reader *bufio.Reader, deleted map[string]bool, cfg *Config, autoMode *bool) bool {
+	if a.kind == actionDirOverlap {
+		return promptOverlap(idx, total, a, lookup, reader, deleted, cfg, autoMode)
+	}
 	items := a.items()
 	kindLabel := "file group"
 	if a.kind == actionTree {
@@ -212,6 +261,12 @@ func promptAction(idx, total int, a *cleanupAction, lookup DirLookup, reader *bu
 // applyAuto keeps index [0] and deletes the rest (for trees, index [0] is
 // the less-frequent cadence when cadence reordering applied).
 func applyAuto(a *cleanupAction, lookup DirLookup, deleted map[string]bool, cfg *Config) {
+	if a.kind == actionDirOverlap {
+		// Keep column A (the cadence-preferred / less-frequent side after
+		// reorientation), delete column B.
+		deleteOverlapSide(&a.overlap, false, deleted, cfg)
+		return
+	}
 	n := 2
 	if a.kind == actionFileGroup {
 		n = len(a.group.Files)
@@ -257,6 +312,209 @@ func printActionHelp() {
     ?        show this help
   (selecting all copies is rejected — at least one must survive)
   Tree actions: [N] is a directory; deleting removes the entire subtree.`)
+}
+
+// ── Directory-overlap (2-column block) actions ──────────────────────────────
+
+// anyAlive reports whether at least one file is not yet deleted.
+func anyAlive(files []ScannedFile, deleted map[string]bool) bool {
+	for _, f := range files {
+		if !deleted[f.Path] {
+			return true
+		}
+	}
+	return false
+}
+
+// reorientBlockByBackupCadence swaps the [1]/[2] columns when rootA has a
+// MORE-frequent (shorter-retention) cadence than rootB, so column [1] is always
+// the safer-to-keep (less-frequent) side that auto/[a] preserves. Reuses the
+// shared cadence parsing; no-op when the roots don't differ only by cadence.
+func reorientBlockByBackupCadence(b *dirOverlapBlock) {
+	ma := cadenceRegex.FindStringSubmatch(b.rootA)
+	mb := cadenceRegex.FindStringSubmatch(b.rootB)
+	if ma == nil || mb == nil || ma[1] != mb[1] || ma[3] != mb[3] {
+		return
+	}
+	if cadenceRank[strings.ToLower(ma[2])] < cadenceRank[strings.ToLower(mb[2])] {
+		b.rootA, b.rootB = b.rootB, b.rootA
+		for i := range b.items {
+			b.items[i].aFiles, b.items[i].bFiles = b.items[i].bFiles, b.items[i].aFiles
+		}
+	}
+}
+
+// promptOverlap renders a 2-column overlap block and handles input. [1]/[2]
+// delete a whole column; [f] resolves this block file-by-file WITHOUT becoming
+// a persistent mode; [a] turns on global auto. Returns true on quit.
+func promptOverlap(idx, total int, a *cleanupAction, lookup DirLookup, reader *bufio.Reader, deleted map[string]bool, cfg *Config, autoMode *bool) bool {
+	b := &a.overlap
+	renderOverlapBlock(idx, total, b)
+	for {
+		fmt.Fprint(os.Stderr, "  Delete column [1], [2], [f]ile-by-file, [s]kip, [a]uto-keep-[1], [q]uit, [?]help: ")
+		line, _ := reader.ReadString('\n')
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "?":
+			printOverlapHelp()
+		case "", "s":
+			return false
+		case "q":
+			return true
+		case "a":
+			*autoMode = true
+			applyAuto(a, lookup, deleted, cfg)
+			return false
+		case "f":
+			return resolveOverlapFileByFile(b, lookup, reader, deleted, cfg)
+		case "1", "2":
+			delA := line == "1"
+			delRoot := b.rootB
+			if delA {
+				delRoot = b.rootA
+			}
+			fmt.Fprintf(os.Stderr, "  Will delete the [%s] column (up to %d file(s)) from %s, keeping the other side. Confirm? [Y/n] ",
+				strings.TrimSpace(line), len(b.items), delRoot)
+			confirm, _ := reader.ReadString('\n')
+			if strings.ToLower(strings.TrimSpace(confirm)) == "n" {
+				continue
+			}
+			deleteOverlapSide(b, delA, deleted, cfg)
+			return false
+		default:
+			fmt.Fprintln(os.Stderr, "  Invalid input. Enter 1, 2, f, s, a, q, or ?")
+		}
+	}
+}
+
+func renderOverlapBlock(idx, total int, b *dirOverlapBlock) {
+	fmt.Fprintf(os.Stderr, "\n[%d/%d] %s reclaimable (folder overlap — %d shared file(s))\n",
+		idx, total, FormatSize(b.sharedBytes), len(b.items))
+	fmt.Fprintf(os.Stderr, "  [1] %s\n  [2] %s\n", b.rootA, b.rootB)
+	const w = 34
+	fmt.Fprintf(os.Stderr, "  shared files (largest first):\n")
+	fmt.Fprintf(os.Stderr, "    %-10s  %-*s  %s\n", "size", w, "[1] (rel)", "[2] (rel)")
+	for _, it := range b.items {
+		fmt.Fprintf(os.Stderr, "    %-10s  %-*s  %s\n",
+			FormatSize(it.size), w, truncLeft(relDisplay(it.aFiles, b.rootA), w), truncLeft(relDisplay(it.bFiles, b.rootB), w))
+	}
+}
+
+// resolveOverlapFileByFile resolves each shared item as an individual file
+// group. localAuto is scoped to THIS block (it never touches the caller's
+// global autoMode), so the next overlap block is shown as a block again.
+func resolveOverlapFileByFile(b *dirOverlapBlock, lookup DirLookup, reader *bufio.Reader, deleted map[string]bool, cfg *Config) bool {
+	localAuto := false
+	fmt.Fprintf(os.Stderr, "  Resolving %d shared file(s) one by one (this block only):\n", len(b.items))
+	for j := range b.items {
+		it := b.items[j]
+		var live []ScannedFile
+		for _, f := range append(append([]ScannedFile{}, it.aFiles...), it.bFiles...) {
+			if !deleted[f.Path] {
+				live = append(live, f)
+			}
+		}
+		if len(live) < 2 {
+			continue
+		}
+		act := &cleanupAction{kind: actionFileGroup, group: DupGroup{Size: it.size, Files: live}}
+		if localAuto {
+			applyAuto(act, lookup, deleted, cfg)
+			continue
+		}
+		if stop := promptAction(j+1, len(b.items), act, lookup, reader, deleted, cfg, &localAuto); stop {
+			return true
+		}
+	}
+	return false
+}
+
+// deleteOverlapSide deletes one column of the block, item by item, but only
+// when that item's OTHER side still has a surviving copy — so a shared file's
+// last copy is never removed. Empty parent dirs are pruned up to the side root.
+func deleteOverlapSide(b *dirOverlapBlock, deleteA bool, deleted map[string]bool, cfg *Config) {
+	root := b.rootA
+	if !deleteA {
+		root = b.rootB
+	}
+	var removed int
+	var touched []string
+	for _, it := range b.items {
+		del, keep := it.aFiles, it.bFiles
+		if !deleteA {
+			del, keep = it.bFiles, it.aFiles
+		}
+		if !anyAlive(keep, deleted) {
+			continue // opposite side already gone — don't remove the last copy
+		}
+		for _, f := range del {
+			if deleted[f.Path] {
+				continue
+			}
+			if err := os.Remove(f.Path); err != nil {
+				fmt.Fprintf(os.Stderr, "  error: %v\n", err)
+				continue
+			}
+			deleted[f.Path] = true
+			removed++
+			touched = append(touched, f.Path)
+			if cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "  deleted: %s\n", f.Path)
+			}
+		}
+	}
+	pruneEmptyDirsUp(touched, root)
+	fmt.Fprintf(os.Stderr, "  Deleted %d file(s) from %s\n", removed, root)
+}
+
+// pruneEmptyDirsUp removes now-empty directories from each file's parent up to
+// (but not including) boundary. Best-effort: os.Remove only succeeds on empty
+// dirs, so it stops climbing at the first non-empty ancestor.
+func pruneEmptyDirsUp(paths []string, boundary string) {
+	tried := map[string]bool{}
+	for _, p := range paths {
+		d := filepath.Dir(p)
+		for d != boundary && len(d) > len(boundary) && strings.HasPrefix(d, boundary) {
+			if tried[d] {
+				break
+			}
+			tried[d] = true
+			if os.Remove(d) != nil {
+				break // non-empty (or error) → stop climbing
+			}
+			d = filepath.Dir(d)
+		}
+	}
+}
+
+func relDisplay(files []ScannedFile, root string) string {
+	if len(files) == 0 {
+		return "-"
+	}
+	rel := strings.TrimPrefix(files[0].Path, root+string(filepath.Separator))
+	if len(files) > 1 {
+		rel += fmt.Sprintf(" (+%d)", len(files)-1)
+	}
+	return rel
+}
+
+func truncLeft(s string, w int) string {
+	if len([]rune(s)) <= w {
+		return s
+	}
+	r := []rune(s)
+	return "…" + string(r[len(r)-w+1:])
+}
+
+func printOverlapHelp() {
+	fmt.Fprintln(os.Stderr, `
+  Folder-overlap commands:
+    1        delete the WHOLE [1] column (keep [2]); never removes a file's last copy
+    2        delete the WHOLE [2] column (keep [1])
+    f        resolve this block file-by-file (does NOT persist to later blocks)
+    s        skip this block
+    a        auto: keep [1], delete [2] for this and all remaining actions
+    q        quit
+    ?        show this help`)
 }
 
 // ── Deletion primitives ─────────────────────────────────────────────────────

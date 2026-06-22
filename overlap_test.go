@@ -2,8 +2,58 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+// TestDeleteOverlapSideKeepsLastCopy is the data-loss guard: deleting a column
+// must skip any item whose OTHER side is already gone, so a shared file's last
+// copy is never removed.
+func TestDeleteOverlapSideKeepsLastCopy(t *testing.T) {
+	root := t.TempDir()
+	ap := filepath.Join(root, "A", "x")
+	bp := filepath.Join(root, "B", "x")
+	writeFile(t, ap, "data")
+	writeFile(t, bp, "data")
+	block := dirOverlapBlock{
+		rootA: filepath.Join(root, "A"), rootB: filepath.Join(root, "B"),
+		items: []overlapItem{{size: 4, aFiles: []ScannedFile{{Path: ap}}, bFiles: []ScannedFile{{Path: bp}}}},
+	}
+	deleted := map[string]bool{bp: true} // B-side already removed by a prior action
+	deleteOverlapSide(&block, true, deleted, &Config{})
+	if deleted[ap] {
+		t.Fatal("A-side deleted though B-side was already gone — last copy lost")
+	}
+	if _, err := os.Stat(ap); err != nil {
+		t.Fatalf("A file must still exist: %v", err)
+	}
+}
+
+// TestDeleteOverlapSideDeletesChosenColumn: normal case deletes the chosen
+// column and keeps the other.
+func TestDeleteOverlapSideDeletesChosenColumn(t *testing.T) {
+	root := t.TempDir()
+	ap := filepath.Join(root, "A", "x")
+	bp := filepath.Join(root, "B", "x")
+	writeFile(t, ap, "data")
+	writeFile(t, bp, "data")
+	block := dirOverlapBlock{
+		rootA: filepath.Join(root, "A"), rootB: filepath.Join(root, "B"),
+		items: []overlapItem{{size: 4, aFiles: []ScannedFile{{Path: ap}}, bFiles: []ScannedFile{{Path: bp}}}},
+	}
+	deleted := map[string]bool{}
+	deleteOverlapSide(&block, false, deleted, &Config{}) // delete column B
+	if !deleted[bp] || deleted[ap] {
+		t.Fatalf("expected B deleted and A kept; deleted=%v", deleted)
+	}
+	if _, err := os.Stat(bp); err == nil {
+		t.Fatal("B file should be gone")
+	}
+	if _, err := os.Stat(ap); err != nil {
+		t.Fatal("A file should still exist")
+	}
+}
 
 func mkGroup(size int64, srcs ...int) DupGroup {
 	g := DupGroup{Size: size}

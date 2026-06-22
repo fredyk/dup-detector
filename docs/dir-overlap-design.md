@@ -1,8 +1,11 @@
 # Diseño: dedup de solapamiento parcial de directorios ("bloques" en 2 columnas)
 
-> Estado: DISEÑO (no implementado). Autor: Opus, 2026-06-22. Pendiente de confirmar
-> decisiones marcadas con ❓ antes de codificar. Esto toca BORRADO de ficheros →
-> data-loss-critical; la red de seguridad son `go test` + verificación a mano.
+> Estado: ✅ IMPLEMENTADO (2026-06-22, ver #17 en CLAUDE.md). Autor: Opus.
+> Componentes: N roots (`--additional-root`, main.go), detección (`overlap.go`
+> `BuildOverlapBlocks`), UI 2-columnas (`cleanup.go` `actionDirOverlap`). Fase 2
+> (auto-discovery single-dir) y output estructurado de bloques quedan pendientes.
+> Esto toca BORRADO de ficheros → data-loss-critical; red de seguridad: `go test`
+> (23 tests, incl. guarda de última-copia) + verificación end-to-end manual.
 
 ## 1. Problema
 
