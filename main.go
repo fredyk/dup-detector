@@ -151,7 +151,22 @@ func init() {
 		"min shared files between two roots to form a folder-overlap block")
 }
 
+// pprofListCmd lists the live pprof endpoints of all running dup-detector scans
+// (each binds its own port; this reads the per-PID discovery files).
+var pprofListCmd = &cobra.Command{
+	Use:           "pprof-list",
+	Short:         "List live dup-detector pprof endpoints (host:port per running scan)",
+	Args:          cobra.NoArgs,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(_ *cobra.Command, _ []string) error {
+		listPprofEndpoints(os.Stdout)
+		return nil
+	},
+}
+
 func main() {
+	rootCmd.AddCommand(pprofListCmd)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -268,9 +283,11 @@ func run(_ *cobra.Command, args []string) error {
 		}
 	}
 
-	// Live profiling endpoint (loopback-only, on by default). Lets a multi-hour
-	// run be profiled while it runs; see pprof.go / DUP_DETECTOR_PPROF.
-	startPprof(status)
+	// Live profiling endpoint (loopback-only, on by default; dynamic port when
+	// 8158 is taken by a concurrent run). Lets a multi-hour run be profiled while
+	// it runs; see pprof.go / DUP_DETECTOR_PPROF / `dup-detector pprof-list`. The
+	// returned cleanup removes the discovery file on clean exit.
+	defer startPprof(status)()
 
 	// Shared inode map: also catches hardlinks pointing to the same inode
 	// across DIR_A and DIR_B when they live on the same filesystem.

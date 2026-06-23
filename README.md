@@ -25,8 +25,18 @@ cd dup-detector
 
 ## Profiling
 
-The binary serves `net/http/pprof` on `http://127.0.0.1:8158/debug/pprof/`
-(loopback-only, on by default), so a long run can be profiled while it runs:
+The binary serves `net/http/pprof` (loopback-only, on by default) so a long run
+can be profiled while it runs. It binds `127.0.0.1:8158` when free, otherwise an
+OS-assigned free port — so multiple concurrent runs each get their own endpoint.
+List the live ones:
+
+```bash
+dup-detector pprof-list
+# pid=12345  http://127.0.0.1:8158/debug/pprof/   started=...
+#     cmd: dup-detector /backups -c
+```
+
+Then profile a specific endpoint:
 
 ```bash
 go tool pprof http://127.0.0.1:8158/debug/pprof/profile?seconds=30   # CPU
@@ -34,7 +44,7 @@ go tool pprof http://127.0.0.1:8158/debug/pprof/heap                 # RAM
 curl  http://127.0.0.1:8158/debug/pprof/goroutine?debug=2            # stacks
 ```
 
-Override the address with `DUP_DETECTOR_PPROF=":6060"`, or disable with
+Force a fixed address with `DUP_DETECTOR_PPROF=":6060"`, or disable with
 `DUP_DETECTOR_PPROF=off`.
 
 ## Usage

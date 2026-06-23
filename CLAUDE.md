@@ -80,10 +80,18 @@ duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, as�
 - [x] **pprof live (on-by-default, loopback)** `pprof.go` arranca `net/http/pprof` en
   **`127.0.0.1:8158`** (solo loopback, nunca expuesto a red) al inicio de `run()`. Permite perfilar un
   run de horas EN VIVO (imposible a posteriori). Override con `DUP_DETECTOR_PPROF=":6060"`, desactivar con
-  `DUP_DETECTOR_PPROF=off`. Bind best-effort: si el puerto está ocupado (otro run concurrente) avisa y
-  sigue sin perfilar. `install.sh` (nuevo) hace el build con `CGO_ENABLED=1` (mattn necesita gcc) y recuerda
-  la URL. Uso: `go tool pprof http://127.0.0.1:8158/debug/pprof/profile?seconds=30` (CPU) / `…/heap` (RAM) /
+  `DUP_DETECTOR_PPROF=off`. `install.sh` hace el build con `CGO_ENABLED=1` (mattn necesita gcc).
+  Uso: `go tool pprof http://127.0.0.1:8158/debug/pprof/profile?seconds=30` (CPU) / `…/heap` (RAM) /
   `curl …/goroutine?debug=2` (stacks).
+  - **Puerto dinámico + descubrimiento por PID (2026-06-23)**: con varios runs concurrentes solo uno podía
+    coger 8158 (los demás se quedaban sin pprof — pasó en real). Ahora `startPprof` intenta 8158 y si está
+    ocupado cae a **`127.0.0.1:0` (puerto efímero del SO)**, saca la dirección real de `ln.Addr()`, y escribe
+    un fichero de descubrimiento **`<cachedir>/pprof/<pid>.json`** `{pid,addr,cmd,started}`. **`dup-detector
+    pprof-list`** (subcomando, `cobra.NoArgs`) lista los endpoints vivos (filtra por PID vivo vía `Signal(0)`,
+    EPERM=vivo para runs root). Limpieza: cleanup diferido borra el fichero al salir limpio; `sweepStalePprof`
+    barre los de PIDs muertos al arrancar (como `CleanStaleStores`). NO se usó unix `.sock` a propósito:
+    `go tool pprof`/`curl` consumen HTTP sobre TCP, un socket rompería el tooling estándar. El fichero por PID
+    (idea de JFMV) cubre el descubrimiento; el TCP efímero, el transporte.
 
 ## ⏳ PENDIENTE / ACEPTADO (deuda residual, baja prioridad)
 - [x] **#13 (CPU — hallado con pprof en run REAL de 13h sobre `/tank/secure4`, 10.9M ficheros)** El cuello
