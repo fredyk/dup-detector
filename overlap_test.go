@@ -30,6 +30,32 @@ func TestDeleteOverlapSideKeepsLastCopy(t *testing.T) {
 	}
 }
 
+// TestDeleteOverlapSideKeepsDirectories enforces the JFMV rule: an overlap
+// (2-column) deletion removes ONLY files, never directories — not even ones it
+// leaves empty.
+func TestDeleteOverlapSideKeepsDirectories(t *testing.T) {
+	root := t.TempDir()
+	ap := filepath.Join(root, "A", "sub", "x")
+	bp := filepath.Join(root, "B", "sub", "x")
+	writeFile(t, ap, "data")
+	writeFile(t, bp, "data")
+	block := dirOverlapBlock{
+		rootA: filepath.Join(root, "A"), rootB: filepath.Join(root, "B"),
+		items: []overlapItem{{size: 4, aFiles: []ScannedFile{{Path: ap}}, bFiles: []ScannedFile{{Path: bp}}}},
+	}
+	deleteOverlapSide(&block, false, map[string]bool{}, &Config{}) // delete B side
+	if _, err := os.Stat(bp); err == nil {
+		t.Fatal("B file should be gone")
+	}
+	// The now-empty B/sub directory must still exist.
+	if _, err := os.Stat(filepath.Join(root, "B", "sub")); err != nil {
+		t.Fatalf("B/sub directory must remain (overlap deletes only files): %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "B")); err != nil {
+		t.Fatalf("B directory must remain: %v", err)
+	}
+}
+
 // TestDeleteOverlapSideDeletesChosenColumn: normal case deletes the chosen
 // column and keeps the other.
 func TestDeleteOverlapSideDeletesChosenColumn(t *testing.T) {
@@ -52,6 +78,66 @@ func TestDeleteOverlapSideDeletesChosenColumn(t *testing.T) {
 	}
 	if _, err := os.Stat(ap); err != nil {
 		t.Fatal("A file should still exist")
+	}
+}
+
+// bySourceColumn is the multi-root column mapping (file's root path by Source).
+func bySourceColumn(roots []string) columnOf {
+	return func(f ScannedFile) string {
+		if f.Source >= 0 && f.Source < len(roots) {
+			return roots[f.Source]
+		}
+		return ""
+	}
+}
+
+func TestVirtualRootOf(t *testing.T) {
+	cases := []struct {
+		path, root string
+		depth      int
+		want       string
+	}{
+		{"/bk/2024-01/a/x", "/bk", 1, "/bk/2024-01"},
+		{"/bk/2024-01/a/x", "/bk", 2, "/bk/2024-01/a"},
+		{"/bk/2024-01/x", "/bk", 1, "/bk/2024-01"},
+		{"/bk/2024-01/x", "/bk", 2, ""}, // file sits exactly at depth 2 → no depth-2 subdir
+		{"/bk/top.txt", "/bk", 1, ""},   // directly under root → no subdir column
+		{"/other/x", "/bk", 1, ""},      // not under root
+	}
+	for _, c := range cases {
+		if got := virtualRootOf(c.path, c.root, c.depth); got != c.want {
+			t.Errorf("virtualRootOf(%q,%q,%d) = %q, want %q", c.path, c.root, c.depth, got, c.want)
+		}
+	}
+}
+
+// TestBuildOverlapBlocksSingleRoot: Fase 2 — within ONE root, subdirs at depth 1
+// are compared pairwise as columns; a group internal to one subdir is not a block.
+func TestBuildOverlapBlocksSingleRoot(t *testing.T) {
+	root := "/bk"
+	colOf := func(f ScannedFile) string { return virtualRootOf(f.Path, root, 1) }
+	mk := func(size int64, pa, pb string) DupGroup {
+		return DupGroup{Size: size, Files: []ScannedFile{{Path: pa, Size: size}, {Path: pb, Size: size}}}
+	}
+	groups := []DupGroup{
+		mk(300, "/bk/A/photos/x", "/bk/B/photos/x"),
+		mk(200, "/bk/A/y", "/bk/B/y"),
+		mk(100, "/bk/A/z", "/bk/B/z"),
+		mk(50, "/bk/A/dup1", "/bk/A/dup2"), // internal to A → 1 column → not a block
+	}
+	blocks, remaining := BuildOverlapBlocks(groups, colOf, 30, 2)
+	if len(blocks) != 1 {
+		t.Fatalf("want 1 block (A vs B), got %d", len(blocks))
+	}
+	b := blocks[0]
+	if b.rootA != "/bk/A" || b.rootB != "/bk/B" {
+		t.Errorf("columns = %q, %q (want /bk/A, /bk/B)", b.rootA, b.rootB)
+	}
+	if len(b.items) != 3 || b.items[0].size != 300 {
+		t.Errorf("items=%d first=%d (want 3, largest 300)", len(b.items), b.items[0].size)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("internal-to-A group should remain a file group; remaining=%d", len(remaining))
 	}
 }
 
@@ -79,7 +165,7 @@ func TestBuildOverlapBlocks(t *testing.T) {
 	// A 3-root group → not eligible for a 2-column block.
 	groups = append(groups, mkGroup(777, 0, 1, 2))
 
-	blocks, remaining := BuildOverlapBlocks(groups, roots, 30, 2)
+	blocks, remaining := BuildOverlapBlocks(groups, bySourceColumn(roots), 30, 2)
 
 	// Pair (0,1) with 35 items → blocks of 30 + 5.
 	if len(blocks) != 2 {
@@ -125,7 +211,7 @@ func TestBuildOverlapBlocks(t *testing.T) {
 func TestBuildOverlapBlocksBelowThreshold(t *testing.T) {
 	roots := []string{"/r0", "/r1"}
 	groups := []DupGroup{mkGroup(100, 0, 1)}
-	blocks, remaining := BuildOverlapBlocks(groups, roots, 30, 2)
+	blocks, remaining := BuildOverlapBlocks(groups, bySourceColumn(roots), 30, 2)
 	if len(blocks) != 0 {
 		t.Fatalf("want 0 blocks (below minOverlap), got %d", len(blocks))
 	}

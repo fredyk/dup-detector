@@ -35,10 +35,13 @@ type Config struct {
 	// root. Default (false) reports only duplicates that bridge >=2 roots.
 	WithinRoot bool
 
-	// Partial directory-overlap blocks (>=2 roots).
+	// Partial directory-overlap blocks.
 	NoOverlap        bool
 	OverlapBlockSize int
 	MinOverlap       int
+	// OverlapDepth: in single-root mode, the depth below the root whose subdirs
+	// are compared pairwise as overlap columns (1 = the root's immediate children).
+	OverlapDepth int
 
 	// Hash cache (only used in -c mode)
 	NoCache      bool
@@ -149,6 +152,8 @@ func init() {
 		"max shared files shown per folder-overlap block (2-column view)")
 	f.IntVar(&cfg.MinOverlap, "min-overlap", defaultMinOverlap,
 		"min shared files between two roots to form a folder-overlap block")
+	f.IntVar(&cfg.OverlapDepth, "overlap-depth", 1,
+		"single-root mode: compare subdirs at this depth below the root as overlap columns (1 = immediate children)")
 }
 
 // pprofListCmd lists the live pprof endpoints of all running dup-detector scans
@@ -451,13 +456,27 @@ func run(_ *cobra.Command, args []string) error {
 		totalWasted += g.WastedBytes()
 	}
 
-	// Group cross-root shared files into 2-column overlap blocks (>=2 roots).
-	// deleteGroups = the file groups NOT absorbed into a block; allGroups stays
-	// intact for the stdout report so no file silently disappears from it.
+	// Group shared files into 2-column overlap blocks. Columns are the roots
+	// (multi-root) or the depth-N subdirs of the single root (single-root,
+	// Fase 2 auto-discovery). deleteGroups = the file groups NOT absorbed into a
+	// block; allGroups stays intact for the stdout report so no file vanishes.
 	var overlapBlocks []dirOverlapBlock
 	deleteGroups := allGroups
-	if !cfg.NoOverlap && len(roots) >= 2 {
-		overlapBlocks, deleteGroups = BuildOverlapBlocks(allGroups, roots, cfg.OverlapBlockSize, cfg.MinOverlap)
+	if !cfg.NoOverlap {
+		var colOf columnOf
+		if len(roots) >= 2 {
+			rootsCopy := roots
+			colOf = func(f ScannedFile) string {
+				if f.Source >= 0 && f.Source < len(rootsCopy) {
+					return rootsCopy[f.Source]
+				}
+				return ""
+			}
+		} else {
+			root, depth := roots[0], cfg.OverlapDepth
+			colOf = func(f ScannedFile) string { return virtualRootOf(f.Path, root, depth) }
+		}
+		overlapBlocks, deleteGroups = BuildOverlapBlocks(allGroups, colOf, cfg.OverlapBlockSize, cfg.MinOverlap)
 	}
 
 	status("Found %d tree duplicate(s), %d folder-overlap block(s), %d file-level group(s), %s reclaimable\n\n",

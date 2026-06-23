@@ -1,6 +1,10 @@
 package main
 
-import "sort"
+import (
+	"path/filepath"
+	"sort"
+	"strings"
+)
 
 // Partial directory-overlap detection.
 //
@@ -50,17 +54,43 @@ func (b *dirOverlapBlock) side(a bool) []ScannedFile {
 	return out
 }
 
-// BuildOverlapBlocks groups cross-root dup groups into 2-column blocks and
-// returns the blocks plus the groups NOT absorbed into any block (which remain
-// individual file-level actions). roots maps Source index → root path.
+// columnOf maps a file to the "column" (a directory path) it belongs to in the
+// 2-column overlap view, or "" to exclude it. Two modes:
+//   - multi-root: the file's root path (roots[f.Source]).
+//   - single-root: the depth-N ancestor subdir under the root (virtualRootOf).
+type columnOf func(ScannedFile) string
+
+// virtualRootOf returns the depth-N ancestor directory of path under root — the
+// overlap "column" in single-root mode — or "" if path is not deep enough (a
+// file at/above the column level can't be attributed to a comparable subdir).
+// Example: root=/bk, depth=1, /bk/2024-01/a/x → /bk/2024-01.
+func virtualRootOf(path, root string, depth int) string {
+	if depth < 1 {
+		depth = 1
+	}
+	sep := string(filepath.Separator)
+	rel := strings.TrimPrefix(path, root+sep)
+	if rel == path {
+		return "" // not under root (shouldn't happen)
+	}
+	parts := strings.Split(rel, sep)
+	if len(parts) <= depth {
+		return "" // file sits at/above the column level → no subdir to compare
+	}
+	return root + sep + filepath.Join(parts[:depth]...)
+}
+
+// BuildOverlapBlocks groups dup groups into 2-column overlap blocks keyed by
+// colOf (root path for multi-root, or depth-N subdir for single-root), and
+// returns the blocks plus the groups NOT absorbed (which stay as individual
+// file-level actions).
 //
-// Only groups spanning EXACTLY two roots are eligible (the clean 2-column case);
-// a group spanning 3+ roots is left as a normal file group (N-way dedup is not a
-// 2-column view). A root pair needs >= minOverlap shared files to form blocks;
-// fewer → those groups stay as file groups too. Within a pair, items are sorted
-// by size DESC and chunked into blocks of blockSize, so block 1 holds the
-// blockSize LARGEST shared files.
-func BuildOverlapBlocks(groups []DupGroup, roots []string, blockSize, minOverlap int) (blocks []dirOverlapBlock, remaining []DupGroup) {
+// Only groups spanning EXACTLY two columns are eligible (the clean 2-column
+// case); a group spanning 3+ columns is left as a normal file group. A column
+// pair needs >= minOverlap shared files to form blocks. Within a pair, items
+// are sorted by size DESC and chunked into blocks of blockSize, so block 1
+// holds the blockSize LARGEST shared files.
+func BuildOverlapBlocks(groups []DupGroup, colOf columnOf, blockSize, minOverlap int) (blocks []dirOverlapBlock, remaining []DupGroup) {
 	if blockSize <= 0 {
 		blockSize = defaultOverlapBlockSize
 	}
@@ -68,7 +98,7 @@ func BuildOverlapBlocks(groups []DupGroup, roots []string, blockSize, minOverlap
 		minOverlap = 2
 	}
 
-	type pairKey struct{ a, b int }
+	type pairKey struct{ a, b string }
 	type cand struct {
 		gi   int
 		item overlapItem
@@ -76,26 +106,29 @@ func BuildOverlapBlocks(groups []DupGroup, roots []string, blockSize, minOverlap
 	pairItems := map[pairKey][]cand{}
 
 	for gi, g := range groups {
-		bySrc := map[int][]ScannedFile{}
+		byCol := map[string][]ScannedFile{}
 		for _, f := range g.Files {
-			bySrc[f.Source] = append(bySrc[f.Source], f)
+			col := colOf(f)
+			if col == "" {
+				continue
+			}
+			byCol[col] = append(byCol[col], f)
 		}
-		if len(bySrc) != 2 { // only clean 2-root groups become blocks
+		if len(byCol) != 2 { // only clean 2-column groups become blocks
 			continue
 		}
-		srcs := make([]int, 0, 2)
-		for s := range bySrc {
-			srcs = append(srcs, s)
+		cols := make([]string, 0, 2)
+		for c := range byCol {
+			cols = append(cols, c)
 		}
-		sort.Ints(srcs)
-		pk := pairKey{srcs[0], srcs[1]}
+		sort.Strings(cols)
+		pk := pairKey{cols[0], cols[1]}
 		pairItems[pk] = append(pairItems[pk], cand{gi, overlapItem{
-			size: g.Size, aFiles: bySrc[srcs[0]], bFiles: bySrc[srcs[1]],
+			size: g.Size, aFiles: byCol[cols[0]], bFiles: byCol[cols[1]],
 		}})
 	}
 
 	absorbed := map[int]bool{}
-	// Deterministic order over pairs (map iteration is random).
 	pks := make([]pairKey, 0, len(pairItems))
 	for pk := range pairItems {
 		pks = append(pks, pk)
@@ -128,7 +161,7 @@ func BuildOverlapBlocks(groups []DupGroup, roots []string, blockSize, minOverlap
 				absorbed[c.gi] = true
 			}
 			blocks = append(blocks, dirOverlapBlock{
-				rootA: roots[pk.a], rootB: roots[pk.b],
+				rootA: pk.a, rootB: pk.b,
 				items: items, sharedBytes: sb,
 			})
 		}

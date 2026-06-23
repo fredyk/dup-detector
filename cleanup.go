@@ -430,14 +430,18 @@ func resolveOverlapFileByFile(b *dirOverlapBlock, lookup DirLookup, reader *bufi
 
 // deleteOverlapSide deletes one column of the block, item by item, but only
 // when that item's OTHER side still has a surviving copy — so a shared file's
-// last copy is never removed. Empty parent dirs are pruned up to the side root.
+// last copy is never removed.
+//
+// RULE (JFMV): an overlap (2-column) deletion removes ONLY files, NEVER
+// directories. A partial overlap means the two folders are NOT identical, so
+// their subdirectory structure must stay intact — even directories left empty
+// are kept. (Full-tree dedup, which does prune dirs, is the separate actionTree.)
 func deleteOverlapSide(b *dirOverlapBlock, deleteA bool, deleted map[string]bool, cfg *Config) {
 	root := b.rootA
 	if !deleteA {
 		root = b.rootB
 	}
 	var removed int
-	var touched []string
 	for _, it := range b.items {
 		del, keep := it.aFiles, it.bFiles
 		if !deleteA {
@@ -456,34 +460,12 @@ func deleteOverlapSide(b *dirOverlapBlock, deleteA bool, deleted map[string]bool
 			}
 			deleted[f.Path] = true
 			removed++
-			touched = append(touched, f.Path)
 			if cfg.Verbose {
 				fmt.Fprintf(os.Stderr, "  deleted: %s\n", f.Path)
 			}
 		}
 	}
-	pruneEmptyDirsUp(touched, root)
-	fmt.Fprintf(os.Stderr, "  Deleted %d file(s) from %s\n", removed, root)
-}
-
-// pruneEmptyDirsUp removes now-empty directories from each file's parent up to
-// (but not including) boundary. Best-effort: os.Remove only succeeds on empty
-// dirs, so it stops climbing at the first non-empty ancestor.
-func pruneEmptyDirsUp(paths []string, boundary string) {
-	tried := map[string]bool{}
-	for _, p := range paths {
-		d := filepath.Dir(p)
-		for d != boundary && len(d) > len(boundary) && strings.HasPrefix(d, boundary) {
-			if tried[d] {
-				break
-			}
-			tried[d] = true
-			if os.Remove(d) != nil {
-				break // non-empty (or error) → stop climbing
-			}
-			d = filepath.Dir(d)
-		}
-	}
+	fmt.Fprintf(os.Stderr, "  Deleted %d file(s) from %s (directories left intact)\n", removed, root)
 }
 
 func relDisplay(files []ScannedFile, root string) string {
