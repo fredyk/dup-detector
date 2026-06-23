@@ -49,6 +49,35 @@ type TreeDupState struct {
 // DirCounter returns the number of files under dir/ cheaply (no materialization).
 type DirCounter func(dir string) int
 
+// memoizeDirCounter wraps a DirCounter with a concurrency-safe per-dir cache.
+// The file store is read-only after Finalize, so a dir's count is constant for
+// the whole detection; but the SAME dir recurs across many candidate pairs, so
+// without memoization the underlying indexed SQL COUNT (a CGo round-trip) was
+// recomputed millions of times and dominated CPU (pprof on a real run: 98% in
+// runtime.cgocall → store.CountUnderDir). verifyPair runs in parallel workers,
+// hence the mutex. A concurrent double-miss may compute a dir twice (harmless,
+// idempotent); writes are serialized.
+func memoizeDirCounter(fn DirCounter) DirCounter {
+	if fn == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	cache := make(map[string]int)
+	return func(dir string) int {
+		mu.Lock()
+		n, ok := cache[dir]
+		mu.Unlock()
+		if ok {
+			return n
+		}
+		n = fn(dir)
+		mu.Lock()
+		cache[dir] = n
+		mu.Unlock()
+		return n
+	}
+}
+
 type dirKey struct{ a, b string } // a < b always (canonical form)
 
 func newDirKey(x, y string) dirKey {

@@ -150,6 +150,15 @@ duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, as�
   30-largest, sharedBytes, umbral, exclusión 3-roots, **guarda de borrado de última copia**), `roots_test.go`.
   Verificado end-to-end (borrado de columna + `[f]`). ⏳ Futuro: output estructurado (json/csv) de bloques;
   auto-discovery de pares de carpetas en single-dir (Fase 2 del diseño); overlap N-way (>2 roots por bloque).
+- [x] **#18 (CPU — hallado con pprof en run REAL, binario con todos los fixes)** Tras #15, la RAM quedó plana
+  (~5 GB plateau, sin runaway; `mergeDedupe` desaparecido). El NUEVO cuello era CPU: **98% en
+  `runtime.cgocall → store.CountUnderDir`**, llamado por `verifyPair` (guard count-first del #5) para CADA par
+  candidato de dirs (`countUnder(dk.a)` + `countUnder(dk.b)`) → millones de `SELECT COUNT(*)` indexados vía CGo.
+  CAUSA: `CountUnderDir(d)` es determinista tras `Finalize()` (store read-only), pero el mismo dir recurre en
+  muchísimos pares y se recalculaba cada vez. FIX: **`memoizeDirCounter`** (`tree_dup.go`) — cache `map[string]int`
+  concurrency-safe (verifyPair corre en workers paralelos) que envuelve `treeState.CountUnder` en `main.go`.
+  Dirs << ficheros → mapa barato. Test `TestMemoizeDirCounter`. Heap a 5 GB es working set LINEAL legítimo:
+  `_Cfunc_GoStringN` ~1.8 GB (strings de ruta de SQLite), `checkedPairs` ~765 MB, `dupIndex` ~372 MB.
 - [x] **#14 (feature pedida por JFMV)** TTL de
   re-verificación de la cache MD5. Flag **`--cache-max-age`**
   (duration, **default 14d**, **`0` = desactivado** = comportamiento actual: confiar para siempre). Semántica:

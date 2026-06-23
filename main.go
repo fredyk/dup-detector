@@ -360,7 +360,9 @@ func run(_ *cobra.Command, args []string) error {
 
 	treeState := NewTreeDupState()
 	treeState.Workers = cfg.Workers
-	treeState.CountUnder = func(d string) int { n, _ := store.CountUnderDir(d); return n }
+	// Memoized: CountUnderDir is an indexed SQL COUNT (CGo) and the same dir
+	// recurs across many candidate pairs; without caching it dominated CPU (#18).
+	treeState.CountUnder = memoizeDirCounter(func(d string) int { n, _ := store.CountUnderDir(d); return n })
 	treeState.CoverageCheck = func(dirA, dirB string, index map[string][]string) (bool, int64, error) {
 		return store.CoverageAndSize(dirA, dirB, index)
 	}

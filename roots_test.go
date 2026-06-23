@@ -1,6 +1,38 @@
 package main
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
+
+// TestMemoizeDirCounter: the underlying counter is called at most once per
+// distinct dir (the #18 CPU fix — CountUnderDir was recomputed per candidate
+// pair), and values are returned correctly.
+func TestMemoizeDirCounter(t *testing.T) {
+	var mu sync.Mutex
+	calls := map[string]int{}
+	base := func(d string) int {
+		mu.Lock()
+		calls[d]++
+		mu.Unlock()
+		return len(d)
+	}
+	memo := memoizeDirCounter(base)
+	for i := 0; i < 50; i++ {
+		if memo("/a") != 2 {
+			t.Fatalf("memo(/a) = %d, want 2", memo("/a"))
+		}
+		if memo("/bbb") != 4 {
+			t.Fatalf("memo(/bbb) = %d, want 4", memo("/bbb"))
+		}
+	}
+	if calls["/a"] != 1 || calls["/bbb"] != 1 {
+		t.Fatalf("underlying called more than once per dir: %v", calls)
+	}
+	if memoizeDirCounter(nil) != nil {
+		t.Fatal("memoizeDirCounter(nil) should be nil")
+	}
+}
 
 // TestSpansMultipleSources locks the N-roots generalization of the old
 // two-source "has both sides" check. The previous implementation special-cased
