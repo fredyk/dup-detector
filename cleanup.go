@@ -336,6 +336,37 @@ func applyAuto(a *cleanupAction, lookup DirLookup, deleted map[string]bool, cfg 
 	applyIndices(a, rest, lookup, deleted, cfg)
 }
 
+// applyGlobRemoval disposes copies selected by --remove-by-glob instead of
+// keep-first: it deletes the copies whose path matches the glob, always leaving
+// at least one survivor. For trees/overlaps it removes the side that matches
+// only when the other side does NOT (never deletes both).
+func applyGlobRemoval(a *cleanupAction, lookup DirLookup, deleted map[string]bool, cfg *Config) {
+	switch a.kind {
+	case actionFileGroup:
+		paths := make([]string, len(a.group.Files))
+		for i, f := range a.group.Files {
+			paths[i] = f.Path
+		}
+		applyIndices(a, selectByGlob(paths, cfg.RemoveByGlob), lookup, deleted, cfg)
+	case actionTree:
+		aM := matchGlob(cfg.RemoveByGlob, a.tree.DirA)
+		bM := matchGlob(cfg.RemoveByGlob, a.tree.DirB)
+		if aM && !bM {
+			deleteTree(a.tree.DirA, lookup, deleted, cfg)
+		} else if bM && !aM {
+			deleteTree(a.tree.DirB, lookup, deleted, cfg)
+		}
+	case actionDirOverlap:
+		aM := matchGlob(cfg.RemoveByGlob, a.overlap.rootA)
+		bM := matchGlob(cfg.RemoveByGlob, a.overlap.rootB)
+		if aM && !bM {
+			deleteOverlapSide(&a.overlap, true, deleted, cfg)
+		} else if bM && !aM {
+			deleteOverlapSide(&a.overlap, false, deleted, cfg)
+		}
+	}
+}
+
 // applyIndices runs the actual deletions for the selected 0-based indices.
 func applyIndices(a *cleanupAction, indices []int, lookup DirLookup, deleted map[string]bool, cfg *Config) {
 	switch a.kind {

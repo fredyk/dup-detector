@@ -30,7 +30,11 @@ func HeadlessDelete(treePairs []TreeDupPair, blocks []dirOverlapBlock, groups []
 			skipped++
 			continue
 		}
-		applyAuto(a, lookup, deleted, cfg)
+		if cfg.RemoveByGlob != "" {
+			applyGlobRemoval(a, lookup, deleted, cfg)
+		} else {
+			applyAuto(a, lookup, deleted, cfg)
+		}
 	}
 
 	if !cfg.Quiet {

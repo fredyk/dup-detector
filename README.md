@@ -98,6 +98,7 @@ dup-detector --progress -v -c DIR_A DIR_B
 | `--dry-run` | `-n` | false | Scan and report only; skip deletion prompt |
 | `--headless` | | false | Non-interactive: auto keep-first, dispose the rest without prompts (combine with `-n` to preview) |
 | `--trash` | | false | Move duplicates to the freedesktop trash of their own filesystem instead of unlinking (reversible) |
+| `--remove-by-glob PATTERN` | | | Headless: delete the copies whose path matches the glob (e.g. `*/tmp/photorec_*`), always keeping ≥1 copy outside the glob. `*` spans `/`. Instead of keep-first, you choose which side dies. |
 | `--progress` | | false | Show progress during scan |
 | `--exclude PATTERN` | | | Exclude files/dirs matching pattern (repeatable) |
 | `--exclude-from FILE` | | | Read exclude patterns from file |

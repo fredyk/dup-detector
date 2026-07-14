@@ -21,6 +21,7 @@ type Config struct {
 	DryRun        bool
 	Headless      bool
 	Trash         bool
+	RemoveByGlob  string
 	Progress      bool
 	Excludes      []string
 	ExcludeFrom   string
@@ -120,6 +121,8 @@ func init() {
 		"non-interactive: auto keep-first, dispose the rest without prompts (combine with -n/--dry-run to preview)")
 	f.BoolVar(&cfg.Trash, "trash", false,
 		"move duplicates to the freedesktop trash of their own filesystem instead of unlinking (reversible)")
+	f.StringVar(&cfg.RemoveByGlob, "remove-by-glob", "",
+		"headless: delete the copies whose path matches this glob (e.g. '*/tmp/photorec_*'), always keeping ≥1 copy outside the glob ('*' spans '/')")
 	f.BoolVar(&cfg.Progress, "progress", false,
 		"show progress during scan")
 	f.StringArrayVar(&cfg.Excludes, "exclude", nil,
