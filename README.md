@@ -111,6 +111,44 @@ dup-detector --progress -v -c DIR_A DIR_B
 | `--cache-path FILE` | | | Path to the MD5 cache DB (default: `~/.cache/dup-detector/hashes.db`) |
 | `--no-progressive` | | false | In `-c` mode, hash only after the full walk (don't overlap with it) |
 
+## Metadata sidecars & `copy` (dedupe remote files without downloading)
+
+Hashing a file for `-c` normally means reading its whole content — ruinous when
+the files live on a remote mount (rclone/gdrive/S3), where every read is a
+download. A **metadata sidecar** breaks that: a `<file>.dup-detector-metadata.json`
+holding the file's `size`, `mtime`, global `md5` and per-chunk `md5`s (plus
+`width`/`height`/`duration`/`capture_time` for images and videos). When `-c`
+scans a file that has a **fresh** sidecar — one whose recorded `size`+`mtime`
+still match — it trusts the recorded MD5 instead of reading the file. Stale or
+missing sidecars are ignored (the file is read normally), so it is always safe.
+
+Sidecars themselves are excluded from the scan, never treated as duplicates.
+
+### `dup-detector copy SRC DST`
+
+Generates those sidecars reliably, at the one moment the bytes are already
+flowing — the copy:
+
+```bash
+dup-detector copy /local/photos /mnt/gdrive/photos
+```
+
+For each file it streams SRC → DST through a 64 MiB buffer, computing the global
+and per-chunk MD5 as it goes; then it **reads the destination back** via a
+byte-range read (a ranged GET on rclone/gdrive/S3, so only the needed bytes are
+fetched) and checks it against the per-chunk hashes; only if that passes does it
+write the sidecar. mtime is preserved so the sidecar validates later. For images
+and videos it also records dimensions / duration / capture time (via `ffprobe`
+when present, else the Go image decoders) so nothing has to re-parse them.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--verify-full` | false | Read back and verify EVERY chunk of the destination (default: only the last chunk) |
+| `--chunk-mib` | 64 | Chunk size in MiB for the streaming hash and read-back verification |
+
+A subsequent `dup-detector -c /mnt/gdrive/photos` then dedupes entirely from the
+sidecars — it reports `N file(s) hashed without reading contents`.
+
 ## Comparison modes
 
 **Default (size + mtime):** fast, good for comparing backups where files were copied preserving timestamps. **Misses real duplicates whose content is identical but whose mtime differs** (e.g. files re-downloaded, re-archived, or copied without `-p`/`--times`) — and may produce false positives for files with identical size and mtime but different content. Use `-c` for accuracy.

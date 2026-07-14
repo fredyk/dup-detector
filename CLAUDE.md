@@ -46,6 +46,27 @@ duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, as�
 ---
 
 ## ✅ HECHO
+- [x] **#21 (feature JFMV — metadata sidecars + `copy`, para deduplicar en la NUBE sin descargar)** Problema:
+  `-c` sobre un mount remoto (rclone/gdrive/S3) descarga cada fichero para hashear. Solución: sidecar
+  **`<fichero>.dup-detector-metadata.json`** (`metadata.go`) con `size`, `mtime` (Unix s, casa con
+  `ScannedFile.ModTime`), `md5` global, `chunk_md5[]` (chunks de 64 MiB) y, para imágenes/vídeos, bloque
+  `media` (width/height/duration/capture_time/codec…). **`cache.Hash` consulta el sidecar ANTES que la cache DB
+  y que leer el fichero**: si es *fresco* (size+mtime coinciden — inode NO se comprueba, en remoto es sintético)
+  usa su md5 sin leer/descargar. Sidecars *stale*/ausentes se ignoran → siempre seguro. Los `.json` se excluyen
+  del scan (`scan.go`, `hasSidecarSuffix`) y de la copia. Contador `sidecarHits` + línea de stats "hashed without
+  reading contents". **`dup-detector copy SRC DST`** (`copy.go`, subcomando cobra) genera los sidecars de forma
+  fiable en el único momento en que los bytes ya fluyen: stream con buffer 64 MiB → md5 global + por-chunk al
+  vuelo → **read-back del destino por `ReadAt`** (ranged GET en rclone: solo baja lo pedido) comparado contra los
+  chunk-md5 → **sidecar escrito SOLO si verifica**; preserva mtime; rollback (`os.Remove`) si falla copia/verify.
+  `--verify-full` (todos los chunks) vs default tail (último chunk); `--chunk-mib`. Metadata multimedia
+  (`media.go`): `ffprobe` si está (extractor universal img+vídeo, `parseFfprobe` sobre su JSON) + fallback
+  `image.DecodeConfig` (stdlib, solo cabecera) para dimensiones — **sin deps de build nuevas**, todo best-effort
+  (nunca rompe la copia). TDD: `metadata_test.go` (round-trip; Hash prefiere sidecar fresco e ignora stale; scan
+  salta sidecars), `media_test.go` (parseFfprobe vídeo/vacío; imageDimensions con PNG generado), `copy_test.go`
+  (copy escribe sidecar verificado + mtime preservado + nº chunks; verifyReadback detecta corrupción y el modo
+  tail no mira el primer chunk). `-race` verde. Verificado e2e: `copy` de dir con imagen → sidecars con `media`
+  320x240; `-c` sobre el destino → "0 computed / 2 hashed without reading contents". ⏳ Futuro: usar el sidecar
+  también en `VerifyTreePairsByContent` (ahora solo en `cache.Hash`); EXIF puro-Go si se quiere sin ffprobe.
 - [x] **#20 (feature JFMV — `--headless` + `--trash`, orquestable sin TTY)** Modo no interactivo para que un
   agente pueda deduplicar sin el prompt interactivo. **`--headless`**: aplica la política *keep-first* del modo
   `a`/auto (conserva 1 copia por grupo — el lado de cadencia menos frecuente cuando los paths difieren solo en

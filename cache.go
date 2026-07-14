@@ -41,9 +41,10 @@ type HashCache struct {
 
 	wmu sync.Mutex // serialize this process's writes
 
-	cmu    sync.Mutex // guards counters
-	hits   int
-	misses int
+	cmu         sync.Mutex // guards counters
+	hits        int
+	misses      int
+	sidecarHits int
 }
 
 // DefaultCachePath returns ~/.cache/dup-detector/hashes.db, honoring
@@ -212,6 +213,16 @@ func OpenHashCache(path string, rehash bool, maxAge time.Duration) (*HashCache, 
 // back immediately so concurrent processes can reuse it. Safe for concurrent
 // use; a nil *HashCache falls back to an uncached read.
 func (c *HashCache) Hash(f ScannedFile) (string, error) {
+	// A fresh sidecar (its recorded size+mtime match the scanned file) is trusted
+	// as the source of truth, ahead of both the DB cache and reading the file.
+	// This is what lets -c dedupe files on a remote mount (rclone/gdrive/S3)
+	// WITHOUT downloading their contents to recompute the MD5.
+	if md5, ok := sidecarMD5(f); ok {
+		if c != nil {
+			c.bump(&c.sidecarHits)
+		}
+		return md5, nil
+	}
 	if c == nil {
 		return md5File(f.Path)
 	}
@@ -274,6 +285,17 @@ func (c *HashCache) Stats() (hits, misses int) {
 	c.cmu.Lock()
 	defer c.cmu.Unlock()
 	return c.hits, c.misses
+}
+
+// SidecarHits returns how many MD5s were served from trusted sidecars this run
+// (i.e. files whose contents were never read/downloaded).
+func (c *HashCache) SidecarHits() int {
+	if c == nil {
+		return 0
+	}
+	c.cmu.Lock()
+	defer c.cmu.Unlock()
+	return c.sidecarHits
 }
 
 // Close releases prepared statements and the database. Writes are already

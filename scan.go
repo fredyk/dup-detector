@@ -134,6 +134,12 @@ func scanWalk(root string, cfg *Config, absExcludes []string, seenInodes map[[2]
 			return nil
 		}
 
+		// Skip our own metadata sidecars — they describe other files and must
+		// never be treated as user data to dedupe.
+		if hasSidecarSuffix(d.Name()) {
+			return nil
+		}
+
 		info, err := d.Info()
 		if err != nil {
 			return nil

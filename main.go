@@ -160,6 +160,12 @@ func init() {
 		"min shared files between two roots to form a folder-overlap block")
 	f.IntVar(&cfg.OverlapDepth, "overlap-depth", 1,
 		"single-root mode: compare subdirs at this depth below the root as overlap columns (1 = immediate children)")
+
+	cf := copyCmd.Flags()
+	cf.BoolVar(&copyVerifyFull, "verify-full", false,
+		"read back and verify EVERY chunk of the destination (default: only the last chunk)")
+	cf.Int64Var(&copyChunkMiB, "chunk-mib", 64,
+		"chunk size in MiB for the streaming hash and read-back verification")
 }
 
 // pprofListCmd lists the live pprof endpoints of all running dup-detector scans
@@ -178,6 +184,7 @@ var pprofListCmd = &cobra.Command{
 
 func main() {
 	rootCmd.AddCommand(pprofListCmd)
+	rootCmd.AddCommand(copyCmd)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -325,6 +332,9 @@ func run(_ *cobra.Command, args []string) error {
 					hits, misses := cache.Stats()
 					fmt.Fprintf(os.Stderr, "  MD5 cache: %d reused, %d computed (%s)\n",
 						hits, misses, cachePath)
+					if sh := cache.SidecarHits(); sh > 0 {
+						fmt.Fprintf(os.Stderr, "  Sidecar metadata: %d file(s) hashed without reading contents\n", sh)
+					}
 				}
 				if cerr := cache.Close(); cerr != nil {
 					fmt.Fprintf(os.Stderr, "warning: closing MD5 cache: %v\n", cerr)
