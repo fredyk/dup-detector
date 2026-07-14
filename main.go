@@ -169,6 +169,8 @@ func init() {
 		"read back and verify EVERY chunk of the destination (default: only the last chunk)")
 	cf.Int64Var(&copyChunkMiB, "chunk-mib", 64,
 		"chunk size in MiB for the streaming hash and read-back verification")
+	cf.IntVar(&copyTransfers, "transfers", 1,
+		"number of files to copy in parallel (higher hides per-file latency on remote mounts like rclone)")
 }
 
 // pprofListCmd lists the live pprof endpoints of all running dup-detector scans

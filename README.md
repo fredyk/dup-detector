@@ -146,6 +146,7 @@ when present, else the Go image decoders) so nothing has to re-parse them.
 |------|---------|-------------|
 | `--verify-full` | false | Read back and verify EVERY chunk of the destination (default: only the last chunk) |
 | `--chunk-mib` | 64 | Chunk size in MiB for the streaming hash and read-back verification |
+| `--transfers` | 1 | Copy this many files in parallel — hides per-file round-trip latency on remote mounts (rclone/gdrive/S3), ~N× faster. A single file's failure is logged and skipped, not fatal. |
 
 A subsequent `dup-detector -c /mnt/gdrive/photos` then dedupes entirely from the
 sidecars — it reports `N file(s) hashed without reading contents`.

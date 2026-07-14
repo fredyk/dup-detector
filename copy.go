@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/spf13/cobra"
 )
@@ -144,7 +145,7 @@ func verifyReadback(dst string, chunkSize int64, chunkMD5 []string, full bool) e
 // copyPath copies a file or directory tree from src to dst, writing a verified
 // sidecar for every regular file. Existing sidecar files in src are skipped
 // (they are regenerated for the destination).
-func copyPath(src, dst string, chunkSize int64, verifyFull bool, onFile func(string, FileMetadata)) error {
+func copyPath(src, dst string, chunkSize int64, verifyFull bool, transfers int, onFile func(string, FileMetadata)) error {
 	info, err := os.Stat(src)
 	if err != nil {
 		return err
@@ -156,30 +157,61 @@ func copyPath(src, dst string, chunkSize int64, verifyFull bool, onFile func(str
 		}
 		return err
 	}
-	return filepath.WalkDir(src, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	if transfers < 1 {
+		transfers = 1
+	}
+
+	// Fixed pool of `transfers` workers copying files concurrently. On a remote
+	// mount each file is a round-trip with real latency, so overlapping N copies
+	// is ~N× faster. A single file's failure is logged and skipped (not fatal):
+	// a whole snapshot shouldn't abort for one bad object — the caller can retry.
+	type job struct{ path, target string }
+	jobs := make(chan job, transfers*2)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+
+	for i := 0; i < transfers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				meta, err := copyFileWithMetadata(j.path, j.target, chunkSize, verifyFull)
+				mu.Lock()
+				if err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					fmt.Fprintf(os.Stderr, "  copy error: %s: %v\n", j.path, err)
+				} else if onFile != nil {
+					onFile(j.target, meta) // serialized under mu → onFile need not be thread-safe
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	walkErr := filepath.WalkDir(src, func(path string, d os.DirEntry, we error) error {
+		if we != nil {
+			return we
 		}
-		if d.IsDir() || !d.Type().IsRegular() {
+		if d.IsDir() || !d.Type().IsRegular() || hasSidecarSuffix(d.Name()) {
 			return nil
-		}
-		if hasSidecarSuffix(d.Name()) {
-			return nil // don't copy source sidecars; we regenerate them
 		}
 		rel, err := filepath.Rel(src, path)
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(dst, rel)
-		meta, err := copyFileWithMetadata(path, target, chunkSize, verifyFull)
-		if err != nil {
-			return err
-		}
-		if onFile != nil {
-			onFile(target, meta)
-		}
+		jobs <- job{path, filepath.Join(dst, rel)}
 		return nil
 	})
+	close(jobs)
+	wg.Wait()
+
+	if walkErr != nil {
+		return walkErr
+	}
+	return firstErr
 }
 
 func hasSidecarSuffix(name string) bool {
@@ -191,6 +223,7 @@ func hasSidecarSuffix(name string) bool {
 var (
 	copyVerifyFull bool
 	copyChunkMiB   int64
+	copyTransfers  int
 )
 
 var copyCmd = &cobra.Command{
@@ -217,7 +250,7 @@ func runCopy(_ *cobra.Command, args []string) error {
 	}
 	var n int
 	var bytes int64
-	err := copyPath(src, dst, chunk, copyVerifyFull, func(target string, meta FileMetadata) {
+	err := copyPath(src, dst, chunk, copyVerifyFull, copyTransfers, func(target string, meta FileMetadata) {
 		n++
 		bytes += meta.Size
 		if !cfg.Quiet {

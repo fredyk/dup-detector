@@ -5,9 +5,39 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestCopyPathParallel(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "out")
+	const N = 25
+	for i := 0; i < N; i++ {
+		writeFile(t, filepath.Join(src, fmt.Sprintf("d%d", i%3), fmt.Sprintf("f%d.txt", i)),
+			fmt.Sprintf("content-number-%d", i))
+	}
+	var mu sync.Mutex
+	count := 0
+	err := copyPath(src, dst, 8, false, 3, func(string, FileMetadata) { mu.Lock(); count++; mu.Unlock() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != N {
+		t.Fatalf("onFile called %d times, want %d", count, N)
+	}
+	for i := 0; i < N; i++ {
+		p := filepath.Join(dst, fmt.Sprintf("d%d", i%3), fmt.Sprintf("f%d.txt", i))
+		b, err := os.ReadFile(p)
+		if err != nil || string(b) != fmt.Sprintf("content-number-%d", i) {
+			t.Errorf("file %d wrong: err=%v content=%q", i, err, b)
+		}
+		if _, err := os.Stat(p + sidecarSuffix); err != nil {
+			t.Errorf("missing sidecar for file %d", i)
+		}
+	}
+}
 
 // chunkHashes computes the per-chunk md5 hex list for content, matching what
 // copyFileWithMetadata records, so tests can build expected verification data.
