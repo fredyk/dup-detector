@@ -96,6 +96,8 @@ dup-detector --progress -v -c DIR_A DIR_B
 | `--verbose` | `-v` | false | Increase verbosity |
 | `--quiet` | `-q` | false | Suppress status output |
 | `--dry-run` | `-n` | false | Scan and report only; skip deletion prompt |
+| `--headless` | | false | Non-interactive: auto keep-first, dispose the rest without prompts (combine with `-n` to preview) |
+| `--trash` | | false | Move duplicates to the freedesktop trash of their own filesystem instead of unlinking (reversible) |
 | `--progress` | | false | Show progress during scan |
 | `--exclude PATTERN` | | | Exclude files/dirs matching pattern (repeatable) |
 | `--exclude-from FILE` | | | Read exclude patterns from file |
@@ -141,6 +143,29 @@ single- vs two-dir, different roots…). Concurrent runs share the cache safely
 in-place edit preserved size+mtime), or `--no-cache` to bypass it entirely.
 
 ## Interactive deletion
+
+### Non-interactive (`--headless`)
+
+For orchestrated/scripted runs where no TTY is available, `--headless` applies
+the same **keep-first** policy the interactive `a` (auto) mode uses — keep one
+copy per group (the safer backup-cadence side when paths differ only by cadence),
+dispose the rest — with no prompts. It composes with the disposal modifiers:
+
+```bash
+# Preview exactly what would go, touching nothing:
+dup-detector -c --headless --dry-run /backups
+
+# Then do it for real, moving dupes to each filesystem's trash (reversible):
+dup-detector -c --headless --trash /backups
+```
+
+`--trash` (usable in interactive mode too) moves each duplicate into the
+freedesktop trash **of the filesystem that holds it** — `<mountpoint>/.Trash-$uid`
+for a mounted volume, `$XDG_DATA_HOME/Trash` for the home filesystem — writing a
+spec-compliant `.trashinfo` so a file manager can restore it. The move stays a
+same-filesystem rename (never a cross-device copy).
+
+### Interactive
 
 After displaying results, you'll be prompted to delete duplicates interactively, starting from the largest files:
 

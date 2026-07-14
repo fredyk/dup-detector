@@ -73,29 +73,7 @@ func InteractiveDelete(treePairs []TreeDupPair, blocks []dirOverlapBlock, groups
 		return nil
 	}
 
-	// Orient so the less-frequent backup cadence sits at the keep slot — auto
-	// mode preserves it across all kinds.
-	reorientPairsByBackupCadence(treePairs)
-	for i := range blocks {
-		reorientBlockByBackupCadence(&blocks[i])
-	}
-	for i := range groups {
-		reorientFilesByBackupCadence(groups[i].Files)
-	}
-
-	actions := make([]cleanupAction, 0, len(treePairs)+len(blocks)+len(groups))
-	for _, t := range treePairs {
-		actions = append(actions, cleanupAction{kind: actionTree, tree: t})
-	}
-	for _, b := range blocks {
-		actions = append(actions, cleanupAction{kind: actionDirOverlap, overlap: b})
-	}
-	for _, g := range groups {
-		actions = append(actions, cleanupAction{kind: actionFileGroup, group: g})
-	}
-	sort.SliceStable(actions, func(i, j int) bool {
-		return actions[i].waste() > actions[j].waste()
-	})
+	actions := buildCleanupActions(treePairs, blocks, groups)
 
 	reader := bufio.NewReader(os.Stdin)
 	deleted := make(map[string]bool)
@@ -134,42 +112,9 @@ func InteractiveDelete(treePairs []TreeDupPair, blocks []dirOverlapBlock, groups
 
 		// Re-resolve survivors against already-deleted paths (prior actions
 		// in this loop may have removed files that also belong here).
-		switch a.kind {
-		case actionTree:
-			if dirFullyDeleted(a.tree.DirA, lookup, deleted) || dirFullyDeleted(a.tree.DirB, lookup, deleted) {
-				skipped++
-				continue
-			}
-		case actionFileGroup:
-			var survivors []ScannedFile
-			for _, f := range a.group.Files {
-				if !deleted[f.Path] {
-					survivors = append(survivors, f)
-				}
-			}
-			if len(survivors) < 2 {
-				skipped++
-				continue
-			}
-			a.group.Files = survivors
-		case actionDirOverlap:
-			// Keep only items that are still a live duplicate: both sides must
-			// still have at least one undeleted copy (a prior action may have
-			// removed one side already).
-			var live []overlapItem
-			var sb int64
-			for _, it := range a.overlap.items {
-				if anyAlive(it.aFiles, deleted) && anyAlive(it.bFiles, deleted) {
-					live = append(live, it)
-					sb += it.size
-				}
-			}
-			if len(live) == 0 {
-				skipped++
-				continue
-			}
-			a.overlap.items = live
-			a.overlap.sharedBytes = sb
+		if reresolveAction(a, lookup, deleted) {
+			skipped++
+			continue
 		}
 
 		if autoMode {
@@ -188,6 +133,116 @@ func InteractiveDelete(treePairs []TreeDupPair, blocks []dirOverlapBlock, groups
 	}
 	printGrandTotal(deleted)
 	return nil
+}
+
+// buildCleanupActions reorients each kind so the safer-to-keep copy sits at the
+// keep slot, then merges tree / overlap / file-group actions into one queue
+// sorted by reclaimable bytes descending. Shared by the interactive and
+// headless drivers so both see identical ordering and keep-first semantics.
+func buildCleanupActions(treePairs []TreeDupPair, blocks []dirOverlapBlock, groups []DupGroup) []cleanupAction {
+	reorientPairsByBackupCadence(treePairs)
+	for i := range blocks {
+		reorientBlockByBackupCadence(&blocks[i])
+	}
+	for i := range groups {
+		reorientFilesByBackupCadence(groups[i].Files)
+	}
+	actions := make([]cleanupAction, 0, len(treePairs)+len(blocks)+len(groups))
+	for _, t := range treePairs {
+		actions = append(actions, cleanupAction{kind: actionTree, tree: t})
+	}
+	for _, b := range blocks {
+		actions = append(actions, cleanupAction{kind: actionDirOverlap, overlap: b})
+	}
+	for _, g := range groups {
+		actions = append(actions, cleanupAction{kind: actionFileGroup, group: g})
+	}
+	sort.SliceStable(actions, func(i, j int) bool {
+		return actions[i].waste() > actions[j].waste()
+	})
+	return actions
+}
+
+// reresolveAction updates a's live copies against paths already disposed by
+// earlier actions and reports whether the action is now moot (fewer than two
+// live copies, i.e. nothing left to safely delete). Mutates a in place.
+func reresolveAction(a *cleanupAction, lookup DirLookup, deleted map[string]bool) (moot bool) {
+	switch a.kind {
+	case actionTree:
+		if dirFullyDeleted(a.tree.DirA, lookup, deleted) || dirFullyDeleted(a.tree.DirB, lookup, deleted) {
+			return true
+		}
+	case actionFileGroup:
+		var survivors []ScannedFile
+		for _, f := range a.group.Files {
+			if !deleted[f.Path] {
+				survivors = append(survivors, f)
+			}
+		}
+		if len(survivors) < 2 {
+			return true
+		}
+		a.group.Files = survivors
+	case actionDirOverlap:
+		// Both sides must still have a live copy, else deleting the remaining
+		// side would remove a file's last copy.
+		var live []overlapItem
+		var sb int64
+		for _, it := range a.overlap.items {
+			if anyAlive(it.aFiles, deleted) && anyAlive(it.bFiles, deleted) {
+				live = append(live, it)
+				sb += it.size
+			}
+		}
+		if len(live) == 0 {
+			return true
+		}
+		a.overlap.items = live
+		a.overlap.sharedBytes = sb
+	}
+	return false
+}
+
+// disposeFile removes one file per cfg policy and records it in deleted on
+// success. It is the single choke point for all deletions so dry-run and
+// --trash behave identically across every action kind:
+//   - DryRun: report what WOULD happen, mark deleted, touch nothing on disk.
+//   - Trash:  move to the file's own per-filesystem trash (reversible).
+//   - else:   unlink.
+func disposeFile(path string, deleted map[string]bool, cfg *Config) bool {
+	if deleted[path] {
+		return false
+	}
+	if cfg.DryRun {
+		verb := "would delete"
+		if cfg.Trash {
+			verb = "would trash"
+		}
+		fmt.Fprintf(os.Stderr, "  %s: %s\n", verb, path)
+		deleted[path] = true
+		return true
+	}
+	if cfg.Trash {
+		dest, err := trashFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  error: %v\n", err)
+			return false
+		}
+		deleted[path] = true
+		if cfg.Verbose {
+			fmt.Fprintf(os.Stderr, "  trashed: %s -> %s\n", path, dest)
+		}
+		return true
+	}
+	if err := os.Remove(path); err != nil {
+		fmt.Fprintf(os.Stderr, "  error: %v\n", err)
+		return false
+	}
+	deleted[path] = true
+	if cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "  deleted: %s\n", path)
+	}
+	return true
 }
 
 // promptAction renders one action and handles user input. Returns true if the
@@ -451,21 +506,18 @@ func deleteOverlapSide(b *dirOverlapBlock, deleteA bool, deleted map[string]bool
 			continue // opposite side already gone — don't remove the last copy
 		}
 		for _, f := range del {
-			if deleted[f.Path] {
-				continue
-			}
-			if err := os.Remove(f.Path); err != nil {
-				fmt.Fprintf(os.Stderr, "  error: %v\n", err)
-				continue
-			}
-			deleted[f.Path] = true
-			removed++
-			if cfg.Verbose {
-				fmt.Fprintf(os.Stderr, "  deleted: %s\n", f.Path)
+			if disposeFile(f.Path, deleted, cfg) {
+				removed++
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "  Deleted %d file(s) from %s (directories left intact)\n", removed, root)
+	verb := "Deleted"
+	if cfg.DryRun {
+		verb = "Would dispose"
+	} else if cfg.Trash {
+		verb = "Trashed"
+	}
+	fmt.Fprintf(os.Stderr, "  %s %d file(s) from %s (directories left intact)\n", verb, removed, root)
 }
 
 func relDisplay(files []ScannedFile, root string) string {
@@ -505,21 +557,22 @@ func deleteTree(dir string, lookup DirLookup, deleted map[string]bool, cfg *Conf
 	files := lookup(dir)
 	var removed int
 	for _, f := range files {
-		if deleted[f.Path] {
-			continue
-		}
-		if err := os.Remove(f.Path); err != nil {
-			fmt.Fprintf(os.Stderr, "  error: %v\n", err)
-		} else {
-			deleted[f.Path] = true
+		if disposeFile(f.Path, deleted, cfg) {
 			removed++
-			if cfg.Verbose {
-				fmt.Fprintf(os.Stderr, "  deleted: %s\n", f.Path)
-			}
 		}
 	}
-	pruneEmptyDirs(dir)
-	fmt.Fprintf(os.Stderr, "  Deleted %d of %d file(s) from %s\n", removed, len(files), dir)
+	// Only prune the now-empty directory skeleton for a real unlink; dry-run
+	// touches nothing, and --trash leaves the structure for the trash tooling.
+	if !cfg.DryRun && !cfg.Trash {
+		pruneEmptyDirs(dir)
+	}
+	verb := "Deleted"
+	if cfg.DryRun {
+		verb = "Would dispose"
+	} else if cfg.Trash {
+		verb = "Trashed"
+	}
+	fmt.Fprintf(os.Stderr, "  %s %d of %d file(s) from %s\n", verb, removed, len(files), dir)
 }
 
 // pruneEmptyDirs removes empty directories inside root, bottom-up.
@@ -548,14 +601,7 @@ func walkDirs(root string, dirs *[]string) error {
 }
 
 func removeFile(path string, _ int64, deleted map[string]bool, cfg *Config) {
-	if err := os.Remove(path); err != nil {
-		fmt.Fprintf(os.Stderr, "  error: %v\n", err)
-		return
-	}
-	deleted[path] = true
-	if cfg.Verbose {
-		fmt.Fprintf(os.Stderr, "  deleted: %s\n", path)
-	}
+	disposeFile(path, deleted, cfg)
 }
 
 func printGrandTotal(deleted map[string]bool) {

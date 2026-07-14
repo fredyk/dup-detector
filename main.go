@@ -19,6 +19,8 @@ type Config struct {
 	Verbose       bool
 	Quiet         bool
 	DryRun        bool
+	Headless      bool
+	Trash         bool
 	Progress      bool
 	Excludes      []string
 	ExcludeFrom   string
@@ -114,6 +116,10 @@ func init() {
 		"suppress status output (duplicates still printed to stdout)")
 	f.BoolVarP(&cfg.DryRun, "dry-run", "n", false,
 		"scan and report only; skip deletion prompt")
+	f.BoolVar(&cfg.Headless, "headless", false,
+		"non-interactive: auto keep-first, dispose the rest without prompts (combine with -n/--dry-run to preview)")
+	f.BoolVar(&cfg.Trash, "trash", false,
+		"move duplicates to the freedesktop trash of their own filesystem instead of unlinking (reversible)")
 	f.BoolVar(&cfg.Progress, "progress", false,
 		"show progress during scan")
 	f.StringArrayVar(&cfg.Excludes, "exclude", nil,
@@ -494,7 +500,12 @@ func run(_ *cobra.Command, args []string) error {
 		}
 	}
 
-	if !cfg.DryRun {
+	switch {
+	case cfg.Headless:
+		if _, err := HeadlessDelete(treeState.Confirmed, overlapBlocks, deleteGroups, lookup, &cfg); err != nil {
+			return err
+		}
+	case !cfg.DryRun:
 		if err := InteractiveDelete(treeState.Confirmed, overlapBlocks, deleteGroups, lookup, &cfg); err != nil {
 			return err
 		}
