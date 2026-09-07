@@ -41,15 +41,38 @@ func (g DupGroup) IDSource() string {
 	return "size+mtime"
 }
 
-// PrintDupCSV writes the complete duplicate list as CSV. roots maps a file's
-// Source index back to the root it was found under; an index outside that list
-// yields an empty root rather than a panic. The header is always written, so an
-// empty report is distinguishable from a run that died before printing.
-func PrintDupCSV(groups []DupGroup, roots []string, w io.Writer) error {
+// DupCSVWriter emits the report as the scan discovers it, instead of holding
+// everything back until the end.
+//
+// The report is meant to be redirected to a file, and a multi-hour scan over a
+// multi-terabyte tree gets killed often enough (earlyoom) that "at the end"
+// frequently means "never". A zero-byte file with the name of a good report
+// reads exactly like "no duplicates found". So the header goes out the moment
+// the writer exists, and every batch as soon as it is known: an interrupted run
+// then leaves a short report, which is honest, instead of an empty one, which
+// lies.
+type DupCSVWriter struct {
+	cw    *csv.Writer
+	roots []string
+}
+
+// NewDupCSVWriter writes the header immediately and returns a writer for the
+// rows. roots maps a file's Source index back to the root it was found under.
+func NewDupCSVWriter(w io.Writer, roots []string) (*DupCSVWriter, error) {
 	cw := csv.NewWriter(w)
 	if err := cw.Write(dupCSVHeader); err != nil {
-		return err
+		return nil, err
 	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		return nil, err
+	}
+	return &DupCSVWriter{cw: cw, roots: roots}, nil
+}
+
+// WriteGroups appends one batch and flushes it. Flushing per batch is what makes
+// the partial report real: buffered rows die with the process.
+func (d *DupCSVWriter) WriteGroups(groups []DupGroup) error {
 	for _, g := range groups {
 		if len(g.Files) == 0 {
 			continue
@@ -63,10 +86,10 @@ func PrintDupCSV(groups []DupGroup, roots []string, w io.Writer) error {
 
 		for _, f := range files {
 			root := ""
-			if f.Source >= 0 && f.Source < len(roots) {
-				root = roots[f.Source]
+			if f.Source >= 0 && f.Source < len(d.roots) {
+				root = d.roots[f.Source]
 			}
-			if err := cw.Write([]string{
+			if err := d.cw.Write([]string{
 				id,
 				source,
 				strconv.FormatInt(f.Size, 10),
@@ -79,8 +102,20 @@ func PrintDupCSV(groups []DupGroup, roots []string, w io.Writer) error {
 			}
 		}
 	}
-	cw.Flush()
-	return cw.Error()
+	d.cw.Flush()
+	return d.cw.Error()
+}
+
+// PrintDupCSV writes a complete duplicate list in one go: the header plus every
+// group. It is the whole report for the runs that have one to hand (the fast
+// size+mtime pass), and the empty report otherwise — the header alone, which is
+// how "no duplicates" is told apart from a run that died before printing.
+func PrintDupCSV(groups []DupGroup, roots []string, w io.Writer) error {
+	d, err := NewDupCSVWriter(w, roots)
+	if err != nil {
+		return err
+	}
+	return d.WriteGroups(groups)
 }
 
 // silenceStdout repoints os.Stdout at stderr and hands back the real stdout.

@@ -364,3 +364,95 @@ func hasPath(hay []string, needle string) bool {
 	}
 	return false
 }
+
+// --- escritura incremental --------------------------------------------------
+//
+// El informe se redirige a un fichero (`> tank_duplicates.csv`), y un scan de
+// varias horas sobre un arbol grande se lo lleva earlyoom con frecuencia. Si el
+// CSV solo se escribe al final, lo que queda es un fichero de CERO bytes con
+// nombre de resultado bueno, que se lee exactamente igual que "no hay
+// duplicados". La cabecera tiene que estar desde el principio, y cada lote en
+// cuanto se conoce.
+
+func TestDupCSVWriterEmitsHeaderBeforeAnyGroup(t *testing.T) {
+	var buf bytes.Buffer
+	if _, err := NewDupCSVWriter(&buf, nil); err != nil {
+		t.Fatalf("NewDupCSVWriter: %v", err)
+	}
+	got := buf.String()
+	want := strings.Join(dupCSVHeader, ",") + "\n"
+	if got != want {
+		t.Fatalf("sin escribir ningun grupo el buffer deberia tener solo la cabecera\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestDupCSVWriterStreamsEachBatchAsItArrives(t *testing.T) {
+	var buf bytes.Buffer
+	w, err := NewDupCSVWriter(&buf, []string{"/rootA"})
+	if err != nil {
+		t.Fatalf("NewDupCSVWriter: %v", err)
+	}
+
+	lote1 := []DupGroup{{Size: 10, Hash: "aaa", Files: []ScannedFile{
+		{Path: "/rootA/1", Size: 10, ModTime: 1700000000},
+		{Path: "/rootA/2", Size: 10, ModTime: 1700000000},
+	}}}
+	if err := w.WriteGroups(lote1); err != nil {
+		t.Fatalf("WriteGroups lote1: %v", err)
+	}
+	tras1 := buf.String()
+	if !strings.Contains(tras1, "/rootA/1") {
+		t.Fatalf("el primer lote no llego al fichero hasta el final: %q", tras1)
+	}
+
+	lote2 := []DupGroup{{Size: 20, Hash: "bbb", Files: []ScannedFile{
+		{Path: "/rootA/3", Size: 20, ModTime: 1700000001},
+		{Path: "/rootA/4", Size: 20, ModTime: 1700000001},
+	}}}
+	if err := w.WriteGroups(lote2); err != nil {
+		t.Fatalf("WriteGroups lote2: %v", err)
+	}
+	if !strings.Contains(buf.String(), "/rootA/3") {
+		t.Fatalf("el segundo lote no se escribio: %q", buf.String())
+	}
+	// Y lo del primer lote sigue donde estaba, en su orden.
+	if strings.Index(buf.String(), "/rootA/1") > strings.Index(buf.String(), "/rootA/3") {
+		t.Fatal("los lotes no salieron en el orden en que se descubrieron")
+	}
+}
+
+// Escribir por lotes no puede cambiar ni una coma del informe: quien lo lea
+// despues tiene que encontrar lo mismo que producia el volcado de una vez.
+func TestDupCSVWriterMatchesSingleShotOutput(t *testing.T) {
+	groups := []DupGroup{
+		{Size: 10, Hash: "aaa", Files: []ScannedFile{
+			{Path: "/rootA/b", Size: 10, ModTime: 1700000000, Source: 0},
+			{Path: "/rootA/a", Size: 10, ModTime: 1700000000, Source: 0},
+		}},
+		{Size: 20, Files: []ScannedFile{
+			{Path: "/rootB/x", Size: 20, ModTime: 1700000001, Source: 1},
+			{Path: "/rootB/y", Size: 20, ModTime: 1700000001, Source: 1},
+		}},
+	}
+	roots := []string{"/rootA", "/rootB"}
+
+	var deUnaVez bytes.Buffer
+	if err := PrintDupCSV(groups, roots, &deUnaVez); err != nil {
+		t.Fatalf("PrintDupCSV: %v", err)
+	}
+
+	var porLotes bytes.Buffer
+	w, err := NewDupCSVWriter(&porLotes, roots)
+	if err != nil {
+		t.Fatalf("NewDupCSVWriter: %v", err)
+	}
+	for _, g := range groups {
+		if err := w.WriteGroups([]DupGroup{g}); err != nil {
+			t.Fatalf("WriteGroups: %v", err)
+		}
+	}
+	if porLotes.String() != deUnaVez.String() {
+		t.Fatalf("el informe por lotes difiere del de una vez\n lotes: %q\n  unico: %q",
+			porLotes.String(), deUnaVez.String())
+	}
+}

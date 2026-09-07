@@ -393,6 +393,18 @@ func run(_ *cobra.Command, args []string) error {
 	}
 	defer store.Close()
 
+	// El informe se abre AQUI, antes del escaneo: en cuanto se conocen los roots
+	// y mucho antes de tener resultados. Un scan de horas sobre un arbol grande
+	// se lo lleva earlyoom a menudo, y un fichero de cero bytes con nombre de
+	// informe se lee igual que "no hay duplicados".
+	var csvWriter *DupCSVWriter
+	if cfg.NoInteractive {
+		csvWriter, err = NewDupCSVWriter(csvOut, roots)
+		if err != nil {
+			return fmt.Errorf("opening CSV report: %w", err)
+		}
+	}
+
 	// Announce the roots to analyze (requirement: print the root list at start).
 	status("Analyzing %d root(s):\n", len(roots))
 	for i, r := range roots {
@@ -472,6 +484,14 @@ func run(_ *cobra.Command, args []string) error {
 				}
 			},
 			func(newGroups []DupGroup) bool {
+				// Al fichero en cuanto se sabe: lo que se queda en memoria
+				// esperando al final muere con el proceso.
+				if csvWriter != nil {
+					if werr := csvWriter.WriteGroups(newGroups); werr != nil {
+						fmt.Fprintf(os.Stderr, "error writing CSV report: %v\n", werr)
+						return false
+					}
+				}
 				allGroups = append(allGroups, newGroups...)
 				// Accumulate newly-confirmed tree dups silently; offering
 				// happens once at the end.
@@ -499,9 +519,9 @@ func run(_ *cobra.Command, args []string) error {
 	if len(allGroups) == 0 && len(finalTrees) == 0 {
 		status("No duplicates found.\n")
 		if cfg.NoInteractive {
-			// Still emit the header: an empty report must be distinguishable
-			// from a run that died before writing anything.
-			return PrintDupCSV(nil, roots, csvOut)
+			// La cabecera ya salio al abrir el informe, que es lo que distingue
+			// "no hay duplicados" de un scan que murio antes de escribir nada.
+			return nil
 		}
 		return nil
 	}
@@ -539,7 +559,12 @@ func run(_ *cobra.Command, args []string) error {
 
 	// Print results to stdout
 	if cfg.NoInteractive {
-		return PrintDupCSV(allGroups, roots, csvOut)
+		// La pasada MD5 ya fue escribiendo cada lote segun lo descubria; solo
+		// queda por volcar lo de la pasada rapida, que llega de una vez.
+		if !cfg.Checksum {
+			return csvWriter.WriteGroups(allGroups)
+		}
+		return nil
 	}
 	if len(finalTrees) > 0 {
 		if err := PrintTreeDups(finalTrees, cfg.Format, os.Stdout); err != nil {
