@@ -46,6 +46,21 @@ duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, as�
 ---
 
 ## ✅ HECHO
+- [x] **#22 (feature JFMV — `--no-interactive`, informe CSV read-only)** Un run orquestado necesitaba la lista
+  COMPLETA de duplicados por stdout, limpia para redirigir a fichero. `--no-interactive` (`no_interactive.go`)
+  imprime **una fila por FICHERO duplicado** (no por grupo: cortar o filtrar el CSV no pierde copias) con
+  `id,id_source,size_bytes,mtime_utc,copies,root,path`. **`id` = lo que hizo duplicado al fichero**: el MD5 del
+  grupo con `-c`, o `s<size>-m<mtime>` sin él (ambos espacios de id no pueden colisionar; `id_source` lo dice
+  explícito). Para llevar el MD5 hasta el report, `DupGroup` gana el campo **`Hash`**, poblado en `checksumGroup`
+  desde el `byHash` que ya existía (cero I/O extra); vacío = el match vino de size+mtime. El header se escribe
+  SIEMPRE, incluso sin duplicados: un informe vacío tiene que distinguirse de un run que murió antes de imprimir.
+  **Mudez de stdout hecha estructural, no print a print**: `silenceStdout()` reapunta `os.Stdout` a stderr y
+  devuelve el stdout real para el CSV, así que cualquier print futuro que nadie recuerde revisar cae en stderr
+  solo. Read-only por contrato: `--no-interactive` con `--headless` o `--remove-by-glob` **falla** en vez de
+  elegir ganador en silencio. TDD `no_interactive_test.go`: forma de fila con MD5 y con size+mtime, dos grupos
+  del mismo tamaño no colapsan a un id, grupos raros (Source fuera de rango) no rompen el CSV, el contrato de
+  `silenceStdout`, y **e2e sobre el binario real** (stdout es SOLO CSV con `--progress` puesto, stderr sigue
+  hablando, disco intacto, header solo cuando no hay nada, y rechazo de los flags destructivos).
 - [x] **#21 (feature JFMV — metadata sidecars + `copy`, para deduplicar en la NUBE sin descargar)** Problema:
   `-c` sobre un mount remoto (rclone/gdrive/S3) descarga cada fichero para hashear. Solución: sidecar
   **`<fichero>.dup-detector-metadata.json`** (`metadata.go`) con `size`, `mtime` (Unix s, casa con

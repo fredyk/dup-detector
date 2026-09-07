@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,6 +21,7 @@ type Config struct {
 	Quiet         bool
 	DryRun        bool
 	Headless      bool
+	NoInteractive bool
 	Trash         bool
 	RemoveByGlob  string
 	Progress      bool
@@ -47,10 +49,10 @@ type Config struct {
 	OverlapDepth int
 
 	// Hash cache (only used in -c mode)
-	NoCache      bool
-	Rehash       bool
-	CachePath    string
-	CacheMaxAge  string
+	NoCache     bool
+	Rehash      bool
+	CachePath   string
+	CacheMaxAge string
 
 	// Output
 	Format string
@@ -98,7 +100,11 @@ Comparison modes:
 Output formats:  columns (default), json, csv, simple
 
 After detection, you will be prompted to interactively delete duplicates
-(largest files first). Use -n/--dry-run to skip the deletion prompt.`,
+(largest files first). Use -n/--dry-run to skip the deletion prompt.
+
+--no-interactive turns the run into a read-only report: stdout carries a single
+CSV with every duplicate file found and nothing else (all status output goes to
+stderr), so it can be piped straight into a file. It never deletes anything.`,
 	Args:          cobra.RangeArgs(1, 2),
 	RunE:          run,
 	SilenceUsage:  true,
@@ -119,6 +125,8 @@ func init() {
 		"scan and report only; skip deletion prompt")
 	f.BoolVar(&cfg.Headless, "headless", false,
 		"non-interactive: auto keep-first, dispose the rest without prompts (combine with -n/--dry-run to preview)")
+	f.BoolVar(&cfg.NoInteractive, "no-interactive", false,
+		"read-only report: write the full duplicate list to stdout as CSV (one row per duplicate file, keyed by MD5 with -c, by size+mtime without it) and divert every other message to stderr")
 	f.BoolVar(&cfg.Trash, "trash", false,
 		"move duplicates to the freedesktop trash of their own filesystem instead of unlinking (reversible)")
 	f.StringVar(&cfg.RemoveByGlob, "remove-by-glob", "",
@@ -197,6 +205,18 @@ func main() {
 }
 
 func run(_ *cobra.Command, args []string) error {
+	// --no-interactive is read-only by contract. Refuse the destructive flags
+	// outright instead of silently picking a winner: a caller who asked for both
+	// has a wrong mental model, and the cost of guessing is deleted files.
+	if cfg.NoInteractive {
+		if cfg.Headless {
+			return fmt.Errorf("--no-interactive is read-only and cannot be combined with --headless")
+		}
+		if cfg.RemoveByGlob != "" {
+			return fmt.Errorf("--no-interactive is read-only and cannot be combined with --remove-by-glob")
+		}
+	}
+
 	// Parse size thresholds
 	var err error
 	if cfg.MinSize, err = ParseSize(cfg.MinSizeStr); err != nil {
@@ -223,6 +243,15 @@ func run(_ *cobra.Command, args []string) error {
 			}
 		}
 		cfg.CacheMaxAgeDur = dur
+	}
+
+	// From here on stdout belongs to the CSV alone: os.Stdout is repointed at
+	// stderr so no present or future print can leak into the report.
+	csvOut := io.Writer(os.Stdout)
+	if cfg.NoInteractive {
+		realOut, restore := silenceStdout()
+		defer restore()
+		csvOut = realOut
 	}
 
 	// Build filter rules.
@@ -469,6 +498,11 @@ func run(_ *cobra.Command, args []string) error {
 
 	if len(allGroups) == 0 && len(finalTrees) == 0 {
 		status("No duplicates found.\n")
+		if cfg.NoInteractive {
+			// Still emit the header: an empty report must be distinguishable
+			// from a run that died before writing anything.
+			return PrintDupCSV(nil, roots, csvOut)
+		}
 		return nil
 	}
 
@@ -504,6 +538,9 @@ func run(_ *cobra.Command, args []string) error {
 		len(finalTrees), len(overlapBlocks), len(allGroups), FormatSize(totalWasted))
 
 	// Print results to stdout
+	if cfg.NoInteractive {
+		return PrintDupCSV(allGroups, roots, csvOut)
+	}
 	if len(finalTrees) > 0 {
 		if err := PrintTreeDups(finalTrees, cfg.Format, os.Stdout); err != nil {
 			return err

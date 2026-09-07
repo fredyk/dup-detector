@@ -12,7 +12,10 @@ import (
 
 // DupGroup is a set of files with identical content.
 type DupGroup struct {
-	Size  int64
+	Size int64
+	// Hash is the shared MD5 hex digest, set only when the group was confirmed
+	// by content (-c). Empty means the match came from size+mtime alone.
+	Hash  string
 	Files []ScannedFile
 }
 
@@ -188,14 +191,14 @@ func checksumGroup(candidates []ScannedFile, size int64, twoDir bool, workers in
 	}
 
 	var groups []DupGroup
-	for _, fs := range byHash {
+	for hash, fs := range byHash {
 		if len(fs) < 2 {
 			continue
 		}
 		if twoDir && !spansMultipleSources(fs) {
 			continue
 		}
-		groups = append(groups, DupGroup{Size: size, Files: fs})
+		groups = append(groups, DupGroup{Size: size, Hash: hash, Files: fs})
 	}
 	return groups, nil
 }
