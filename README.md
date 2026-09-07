@@ -83,6 +83,9 @@ dup-detector -n DIR_A DIR_B
 # Output as JSON and pipe to a file
 dup-detector -n --format json DIR_A DIR_B > duplicates.json
 
+# Read-only CSV report: the full duplicate list on stdout, nothing else
+dup-detector -c --no-interactive /tank > duplicates.csv
+
 # Verbose with progress bar
 dup-detector --progress -v -c DIR_A DIR_B
 ```
@@ -97,6 +100,7 @@ dup-detector --progress -v -c DIR_A DIR_B
 | `--quiet` | `-q` | false | Suppress status output |
 | `--dry-run` | `-n` | false | Scan and report only; skip deletion prompt |
 | `--headless` | | false | Non-interactive: auto keep-first, dispose the rest without prompts (combine with `-n` to preview) |
+| `--no-interactive` | | false | Read-only CSV report of every duplicate on stdout; all other output goes to stderr |
 | `--trash` | | false | Move duplicates to the freedesktop trash of their own filesystem instead of unlinking (reversible) |
 | `--remove-by-glob PATTERN` | | | Headless: delete the copies whose path matches the glob (e.g. `*/tmp/photorec_*`), always keeping ≥1 copy outside the glob. `*` spans `/`. Instead of keep-first, you choose which side dies. |
 | `--progress` | | false | Show progress during scan |
@@ -183,6 +187,35 @@ single- vs two-dir, different roots…). Concurrent runs share the cache safely
 in-place edit preserved size+mtime), or `--no-cache` to bypass it entirely.
 
 ## Interactive deletion
+
+### Read-only report (`--no-interactive`)
+
+`--no-interactive` turns the run into a pure reporter, for piping straight into
+a file or another tool. **stdout carries one CSV and nothing else** — status
+lines, progress and warnings all go to stderr — and nothing on disk is touched:
+
+```bash
+dup-detector -c --no-interactive /tank > duplicates.csv
+```
+
+One row per duplicate **file** (not per group), so cutting or filtering the CSV
+never loses a copy:
+
+| Column | Meaning |
+|--------|---------|
+| `id` | What made these files duplicates: the MD5 with `-c`, otherwise `s<size>-m<mtime>` |
+| `id_source` | `md5` or `size+mtime` — never guess whether a run was content-verified |
+| `size_bytes` | Size of the file |
+| `mtime_utc` | Modification time, RFC 3339 UTC |
+| `copies` | How many copies the group holds |
+| `root` | The scanned root the file was found under |
+| `path` | Absolute path |
+
+Copies of the same file share an `id`, so `sort` on that column regroups them.
+The header is written even when nothing is found, so an empty report is
+distinguishable from a run that died before printing. Being read-only is a
+contract, not a default: combining it with `--headless` or `--remove-by-glob`
+is rejected outright.
 
 ### Non-interactive (`--headless`)
 
