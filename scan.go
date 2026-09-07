@@ -152,14 +152,18 @@ func scanWalk(root string, cfg *Config, absExcludes []string, seenInodes map[[2]
 			// Store only the key (struct{}), not the path: at 10M+ files keeping a
 			// path string per inode was the last O(files) RAM term (~2 GB). The
 			// verbose message loses the "→ first path" detail; the dedup is identical.
-			if _, exists := seenInodes[key]; exists {
-				hardlinkCount++
-				if cfg.Verbose {
-					fmt.Fprintf(os.Stderr, "  hardlink: %s (skipped, same inode as earlier file)\n", path)
+			// Solo entran en el mapa los inodos con más de un nombre: son los
+			// únicos que pueden reaparecer. Ver tieneVariosNombres.
+			if tieneVariosNombres(info) {
+				if _, exists := seenInodes[key]; exists {
+					hardlinkCount++
+					if cfg.Verbose {
+						fmt.Fprintf(os.Stderr, "  hardlink: %s (skipped, same inode as earlier file)\n", path)
+					}
+					return nil
 				}
-				return nil
+				seenInodes[key] = struct{}{}
 			}
-			seenInodes[key] = struct{}{}
 		}
 
 		size := info.Size()
