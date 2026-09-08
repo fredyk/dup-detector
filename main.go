@@ -204,7 +204,7 @@ func main() {
 	}
 }
 
-func run(_ *cobra.Command, args []string) error {
+func run(cmd *cobra.Command, args []string) error {
 	// --no-interactive is read-only by contract. Refuse the destructive flags
 	// outright instead of silently picking a winner: a caller who asked for both
 	// has a wrong mental model, and the cost of guessing is deleted files.
@@ -214,6 +214,12 @@ func run(_ *cobra.Command, args []string) error {
 		}
 		if cfg.RemoveByGlob != "" {
 			return fmt.Errorf("--no-interactive is read-only and cannot be combined with --remove-by-glob")
+		}
+		// El progreso va a stderr, que en este modo no puede contaminar el CSV.
+		// Sin el, un recorrido de horas no emite una sola senal de estar vivo y
+		// no hay forma de distinguirlo de un proceso colgado.
+		if cmd != nil && !cmd.Flags().Changed("progress") {
+			cfg.Progress = true
 		}
 	}
 
@@ -440,7 +446,10 @@ func run(_ *cobra.Command, args []string) error {
 	}
 
 	// ── Phase 1: fast tree detection via directory hashing ───────────────────
-	status("Detecting duplicates (fast pass)...\n")
+	// El informe CSV lista grupos de FICHEROS: los pares de arbol no tienen fila
+	// en el, asi que en --no-interactive esta pasada entera (y su verificacion
+	// por contenido) seria trabajo para tirar el resultado.
+	trees := !cfg.NoInteractive
 
 	treeState := NewTreeDupState()
 	treeState.Workers = cfg.Workers
@@ -452,25 +461,30 @@ func run(_ *cobra.Command, args []string) error {
 	}
 	var allGroups []DupGroup
 
-	var hashProgressFn func(done, total int)
-	if cfg.Progress {
-		hashProgressFn = func(done, total int) {
-			fmt.Fprintf(os.Stderr, "\r  hashing dirs: %d / %d files  ", done, total)
+	if trees {
+		status("Detecting duplicates (fast pass)...\n")
+
+		var hashProgressFn func(done, total int)
+		if cfg.Progress {
+			hashProgressFn = func(done, total int) {
+				fmt.Fprintf(os.Stderr, "\r  hashing dirs: %d / %d files  ", done, total)
+			}
 		}
+		earlyTrees, terr := FindTreeDupsByHashStore(store, &cfg, hashProgressFn)
+		if terr != nil {
+			return fmt.Errorf("tree detection: %w", terr)
+		}
+		if cfg.Progress {
+			fmt.Fprintln(os.Stderr)
+		}
+		if cfg.Checksum {
+			// Upgrade the fast mtime-based tree pairs to content-verified before
+			// they can ever be offered for deletion (size+mtime collide in backups).
+			earlyTrees = VerifyTreePairsByContent(earlyTrees, lookup, cache)
+		}
+		status("  fast pass: %d tree pair(s)\n", len(earlyTrees))
+		treeState.AddConfirmed(earlyTrees)
 	}
-	earlyTrees, err := FindTreeDupsByHashStore(store, &cfg, hashProgressFn)
-	if err != nil {
-		return fmt.Errorf("tree detection: %w", err)
-	}
-	if cfg.Progress {
-		fmt.Fprintln(os.Stderr)
-	}
-	if cfg.Checksum {
-		// Upgrade the fast mtime-based tree pairs to content-verified before they
-		// can ever be offered for deletion (size+mtime collide in backups).
-		earlyTrees = VerifyTreePairsByContent(earlyTrees, lookup, cache)
-	}
-	treeState.AddConfirmed(earlyTrees)
 
 	// ── Phase 2: MD5 (only if -c flag set) ───────────────────────────────────
 	if cfg.Checksum {
@@ -495,7 +509,9 @@ func run(_ *cobra.Command, args []string) error {
 				allGroups = append(allGroups, newGroups...)
 				// Accumulate newly-confirmed tree dups silently; offering
 				// happens once at the end.
-				treeState.AddGroups(newGroups, lookup, true)
+				if trees {
+					treeState.AddGroups(newGroups, lookup, true)
+				}
 				return true
 			},
 		)
@@ -531,6 +547,18 @@ func run(_ *cobra.Command, args []string) error {
 		totalWasted += g.WastedBytes()
 	}
 
+	// El informe se cierra aqui: los bloques de solapamiento son material de la
+	// cola interactiva y tampoco tienen fila en el CSV.
+	if cfg.NoInteractive {
+		status("Found %d file-level group(s), %s reclaimable\n", len(allGroups), FormatSize(totalWasted))
+		// La pasada MD5 ya fue escribiendo cada lote segun lo descubria; solo
+		// queda por volcar lo de la pasada rapida, que llega de una vez.
+		if !cfg.Checksum {
+			return csvWriter.WriteGroups(allGroups)
+		}
+		return nil
+	}
+
 	// Group shared files into 2-column overlap blocks. Columns are the roots
 	// (multi-root) or the depth-N subdirs of the single root (single-root,
 	// Fase 2 auto-discovery). deleteGroups = the file groups NOT absorbed into a
@@ -558,14 +586,6 @@ func run(_ *cobra.Command, args []string) error {
 		len(finalTrees), len(overlapBlocks), len(allGroups), FormatSize(totalWasted))
 
 	// Print results to stdout
-	if cfg.NoInteractive {
-		// La pasada MD5 ya fue escribiendo cada lote segun lo descubria; solo
-		// queda por volcar lo de la pasada rapida, que llega de una vez.
-		if !cfg.Checksum {
-			return csvWriter.WriteGroups(allGroups)
-		}
-		return nil
-	}
 	if len(finalTrees) > 0 {
 		if err := PrintTreeDups(finalTrees, cfg.Format, os.Stdout); err != nil {
 			return err

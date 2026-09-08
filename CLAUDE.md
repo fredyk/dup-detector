@@ -46,6 +46,28 @@ duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, as�
 ---
 
 ## ✅ HECHO
+- [x] **#23 (CPU/IO — hallado con pprof en el run REAL de `/tank`, 18 M ficheros)** Tras el fix del heap
+  (`seenInodes` solo para inodos con varios nombres), el run se plantó **16 h en la pasada rápida de
+  árboles sin escribir una sola fila del CSV**, al 5 % de un núcleo y con 66 GB leídos del disco.
+  Medido, no supuesto: 12 muestras de `/debug/pprof/goroutine` seguidas y 3 separadas en minutos, todas
+  en `verifyTreePairMtimeStore → dirStoreIncomplete`, 9 de cada 10 dentro de su `filepath.WalkDir`; los
+  fd abiertos del proceso apuntaban a `themes/twentytwentythree` de copias semanales/trimestrales de
+  WordPress, o sea el caso patológico: cientos de directorios idénticos. **CAUSA 1**: `dirStoreIncomplete`
+  recorría el directorio ENTERO en disco **por cada PAR candidato**; k directorios idénticos generan
+  k(k-1)/2 pares, así que con el tope de `maxDirsPerBucket` (2000) son ~4 M recorridos donde bastan 2000.
+  Y la guarda está armada SIEMPRE: `defaultExcludes` deja `cfg.Rules` no vacío aunque el usuario no pase
+  filtros. **FIX**: `dirStoreChecker` (`store_tree.go`), que memoiza por directorio tanto el `CountUnderDir`
+  del store como el recorrido de disco —ambas respuestas son fijas dentro de un run, el store es read-only
+  tras `Finalize`— y se comparte en todo el lote vía `verifyPairsMtimeStore`. Mismo patrón que el #18.
+  **CAUSA 2**: `--no-interactive` gastaba esa pasada entera (más `VerifyTreePairsByContent`, más
+  `AddGroups` en cada lote MD5, más `BuildOverlapBlocks`) para tirar el resultado: **el CSV es de grupos de
+  FICHEROS y los pares de árbol no tienen fila en él**. **FIX**: en ese modo no se ejecuta. Además
+  `--progress` pasa a estar **ON por defecto con `--no-interactive`** (va a stderr, no puede contaminar el
+  informe) — su ausencia dejó 15 h de silencio indistinguible de un cuelgue — y la pasada rápida deja de
+  ser muda: imprime cuántos pares encontró. TDD `arbol_verificacion_test.go`: la caché no vuelve al disco
+  para el mismo dir, 3 pares sobre 3 dirs recorren 3 veces y no 6, y e2e sobre el binario de que
+  `--no-interactive` no lanza la pasada rápida sin perder ni una fila del CSV. Prueba de intervención
+  hecha en los dos: quitando la caché y volviendo a activar la pasada, los tests caen.
 - [x] **#22 (feature JFMV — `--no-interactive`, informe CSV read-only)** Un run orquestado necesitaba la lista
   COMPLETA de duplicados por stdout, limpia para redirigir a fichero. `--no-interactive` (`no_interactive.go`)
   imprime **una fila por FICHERO duplicado** (no por grupo: cortar o filtrar el CSV no pierde copias) con

@@ -6,32 +6,91 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
-// dirStoreIncomplete reports whether the real directory on disk holds more
-// regular files than the store knows about — i.e. some were dropped by a filter
-// (--min/max-size, --exclude) or hardlink-skipped. When true the store's view of
-// the tree is incomplete, so a tree-dup claim would be unsound. Fail safe: any
-// read error returns true (reject). Filter-agnostic — it just counts.
-func dirStoreIncomplete(dir string, fs *FileStore) bool {
-	stored, err := fs.CountUnderDir(dir) // COUNT, not materialize
-	if err != nil {
-		return true
-	}
-	real := 0
-	werr := filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+// countFilesOnDisk counts the regular files under dir by walking the real tree.
+func countFilesOnDisk(dir string) (int, error) {
+	n := 0
+	err := filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if !d.IsDir() && d.Type().IsRegular() {
-			real++
+			n++
 		}
 		return nil
 	})
-	if werr != nil {
-		return true
+	return n, err
+}
+
+// dirStoreChecker answers, per directory, the two questions the tree-pair
+// verification asks: how many files the store holds under it, and whether the
+// real tree on disk holds more (i.e. some were dropped by a filter or by the
+// hardlink skip, which makes a tree-dup claim unsound).
+//
+// Both answers are memoized because both are fixed within a run — the store is
+// read-only after Finalize — while the same directory shows up in EVERY pair of
+// its bucket: k identical dirs produce k(k-1)/2 pairs, so the uncached cost was
+// O(pairs) full disk walks where O(dirs) suffices. And the guard is armed on
+// every run, filters or not: defaultExcludes always leaves cfg.Rules non-empty.
+// Measured on a real /tank run: 16 h at 5 % of one core, 66 GB read from the
+// storage layer, with 9 of every 10 pprof samples inside this walk.
+type dirStoreChecker struct {
+	fs        *FileStore
+	walkCount func(dir string) (int, error)
+
+	mu         sync.Mutex
+	stored     map[string]int
+	incomplete map[string]bool
+}
+
+func newDirStoreChecker(fs *FileStore) *dirStoreChecker {
+	return &dirStoreChecker{
+		fs:         fs,
+		walkCount:  countFilesOnDisk,
+		stored:     make(map[string]int),
+		incomplete: make(map[string]bool),
 	}
-	return real != stored
+}
+
+// countStored is the memoized fs.CountUnderDir.
+func (c *dirStoreChecker) countStored(dir string) (int, error) {
+	c.mu.Lock()
+	n, ok := c.stored[dir]
+	c.mu.Unlock()
+	if ok {
+		return n, nil
+	}
+	n, err := c.fs.CountUnderDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	c.mu.Lock()
+	c.stored[dir] = n
+	c.mu.Unlock()
+	return n, nil
+}
+
+// incompleteDir reports whether the real directory on disk holds more regular
+// files than the store knows about. Fail safe: any read error returns true.
+func (c *dirStoreChecker) incompleteDir(dir string) bool {
+	c.mu.Lock()
+	v, ok := c.incomplete[dir]
+	c.mu.Unlock()
+	if ok {
+		return v
+	}
+	res := true
+	if stored, err := c.countStored(dir); err == nil {
+		if real, werr := c.walkCount(dir); werr == nil {
+			res = real != stored
+		}
+	}
+	c.mu.Lock()
+	c.incomplete[dir] = res
+	c.mu.Unlock()
+	return res
 }
 
 // FindTreeDupsByHashStore is the store-backed FindTreeDupsByHash. It streams the
@@ -150,17 +209,10 @@ func FindTreeDupsByHashStore(fs *FileStore, cfg *Config, onProgress func(done, t
 	pairs = removeSubPairsFast(pairs)
 
 	// Verify every surviving pair (the accum hash only walks bounded depth).
-	verified := pairs[:0]
-	for _, p := range pairs {
-		ok, err := verifyTreePairMtimeStore(p.DirA, p.DirB, fs, cfg)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			verified = append(verified, p)
-		}
+	pairs, err = verifyPairsMtimeStore(pairs, fs, cfg, newDirStoreChecker(fs))
+	if err != nil {
+		return nil, err
 	}
-	pairs = verified
 
 	sort.Slice(pairs, func(a, b int) bool { return pairs[a].TotalSize > pairs[b].TotalSize })
 	return pairs, nil
@@ -214,27 +266,47 @@ func treePairContentEqual(p TreeDupPair, lookup DirLookup, cache *HashCache) boo
 
 // verifyTreePairMtimeStore is the store-backed verifyTreePairMtime: it pulls each
 // dir's files with a prefix-range query instead of binary-searching a slice.
-func verifyTreePairMtimeStore(dirA, dirB string, fs *FileStore, cfg *Config) (bool, error) {
+// verifyPairsMtimeStore keeps the pairs whose two dirs really match, sharing one
+// dirStoreChecker across the whole batch so each directory is read from disk and
+// counted in the store once, not once per pair it takes part in.
+func verifyPairsMtimeStore(pairs []TreeDupPair, fs *FileStore, cfg *Config, chk *dirStoreChecker) ([]TreeDupPair, error) {
+	verified := pairs[:0]
+	for _, p := range pairs {
+		ok, err := verifyTreePairMtimeStore(p.DirA, p.DirB, fs, cfg, chk)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			verified = append(verified, p)
+		}
+	}
+	return verified, nil
+}
+
+func verifyTreePairMtimeStore(dirA, dirB string, fs *FileStore, cfg *Config, chk *dirStoreChecker) (bool, error) {
+	if chk == nil {
+		chk = newDirStoreChecker(fs)
+	}
 	// Soundness guard for filtered scans: when --min/max-size or --exclude/--include
 	// is active, files removed by the filter were never stored, so the store's view
 	// of a dir is incomplete and a "tree dup" claim would be unsound (two dirs can
 	// match on the visible files yet differ in the filtered ones). Confirm only if
 	// BOTH dirs are fully represented in the store. Fail safe (reject) on doubt.
 	if cfg != nil && (cfg.MinSize > 0 || cfg.MaxSize > 0 || len(cfg.Rules) > 0) {
-		if dirStoreIncomplete(dirA, fs) || dirStoreIncomplete(dirB, fs) {
+		if chk.incompleteDir(dirA) || chk.incompleteDir(dirB) {
 			return false, nil
 		}
 	}
 
 	// Count-first: reject mismatched pairs without materializing huge dir lists.
-	na, err := fs.CountUnderDir(dirA)
+	na, err := chk.countStored(dirA)
 	if err != nil {
 		return false, err
 	}
 	if na == 0 {
 		return false, nil
 	}
-	if nb, err := fs.CountUnderDir(dirB); err != nil {
+	if nb, err := chk.countStored(dirB); err != nil {
 		return false, err
 	} else if na != nb {
 		return false, nil
