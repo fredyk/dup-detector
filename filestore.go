@@ -25,16 +25,21 @@ type FileStore struct {
 	insert *sql.Stmt
 	tx     *sql.Tx
 	n      int
+	keep   bool // el inventario sobrevive a Close (--scan-store)
 }
 
 const fsBatch = 50000 // rows per insert transaction
 
 // CleanStaleStores removes leftover scan DBs from earlier runs that died before
 // Close() (kill/OOM). A file dup-detector-scan-<pid>.db is stale iff <pid> is no
-// longer running. Best-effort; ignores errors.
-func CleanStaleStores(dir string) {
+// longer running. keep, when set, is the inventory this run is about to use and
+// is never swept. Best-effort; ignores errors.
+func CleanStaleStores(dir, keep string) {
 	matches, _ := filepath.Glob(filepath.Join(dir, "dup-detector-scan-*.db"))
 	for _, m := range matches {
+		if keep != "" && sameFilePath(m, keep) {
+			continue // inventario que el run va a usar
+		}
 		var pid int
 		if _, err := fmt.Sscanf(filepath.Base(m), "dup-detector-scan-%d.db", &pid); err != nil {
 			continue
@@ -48,10 +53,49 @@ func CleanStaleStores(dir string) {
 	}
 }
 
+// sameFilePath compares two paths after cleaning and resolving them.
+func sameFilePath(a, b string) bool {
+	ra, err := filepath.Abs(a)
+	if err != nil {
+		return false
+	}
+	rb, err := filepath.Abs(b)
+	if err != nil {
+		return false
+	}
+	return filepath.Clean(ra) == filepath.Clean(rb)
+}
+
 // processAlive reports whether pid is a live process (Linux /proc check).
 func processAlive(pid int) bool {
 	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
 	return err == nil
+}
+
+// OpenFileStore reopens an inventory written by an earlier run instead of
+// walking the tree again: on a multi-million-file tree the walk costs hours and
+// re-running the detection over the same files must not pay them twice. The
+// store is opened read-only and Close never removes it.
+func OpenFileStore(path string) (*FileStore, error) {
+	db, err := sql.Open("sqlite3", "file:"+path+"?mode=ro&_query_only=1&_temp_store=FILE")
+	if err != nil {
+		return nil, err
+	}
+	fs := &FileStore{db: db, path: path, keep: true}
+	// Un fichero que existe pero no tiene la tabla (o quedo a medias) no es un
+	// inventario: mejor decirlo que servir un informe vacio.
+	if _, err := fs.Count(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("%s no es un inventario de dup-detector: %w", path, err)
+	}
+	var n int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_size','idx_path')`).Scan(&n); err != nil || n != 2 {
+		db.Close()
+		return nil, fmt.Errorf("el inventario %s quedo sin indexar: el run que lo escribio no llego a terminar el recorrido", path)
+	}
+	db.SetMaxOpenConns(runtime.NumCPU())
+	return fs, nil
 }
 
 // NewFileStore creates a fresh scratch DB at path (removing any prior file).
@@ -303,6 +347,9 @@ func (fs *FileStore) Close() error {
 		fs.insert.Close()
 	}
 	err := fs.db.Close()
+	if fs.keep {
+		return err
+	}
 	_ = os.Remove(fs.path)
 	_ = os.Remove(fs.path + "-wal")
 	_ = os.Remove(fs.path + "-shm")

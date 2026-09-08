@@ -46,6 +46,18 @@ duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, as�
 ---
 
 ## ✅ HECHO
+- [x] **#24 (`--scan-store`: el inventario deja de tirarse a la basura)** El recorrido de `/tank` (18 M
+  ficheros) cuesta **15 h**, y hasta ahora el `FileStore` era un scratch que `Close()` borraba: cualquier
+  cambio de flags, cualquier parada, obligaba a pagarlas otra vez. **`--scan-store PATH`** guarda ahí el
+  inventario y, si el fichero ya existe, lo **reutiliza sin volver a recorrer nada** (`OpenFileStore`,
+  `mode=ro&_query_only=1`, `FileStore.keep` para que `Close` no lo borre, y `CleanStaleStores` recibe la
+  ruta a respetar). Un inventario abierto sin la tabla `files` o **sin los índices** se rechaza con un
+  error que dice por qué: sin `idx_size`/`idx_path` el run que lo escribió no llegó a terminar el
+  recorrido, y servir un informe vacío sería peor. **Reutilizar solo informa**: con un inventario ya
+  existente se exige `--no-interactive` o `--dry-run`, porque una foto vieja nombra ficheros que pueden
+  haberse movido y borrar según ella es borrar a ciegas. TDD `scan_store_test.go`: la segunda pasada no
+  imprime «Scanning» y da el MISMO CSV aunque entre las dos se creen duplicados nuevos (es la prueba de
+  que no volvió a recorrer), y `--headless` sobre un inventario reutilizado falla sin tocar el disco.
 - [x] **#23 (CPU/IO — hallado con pprof en el run REAL de `/tank`, 18 M ficheros)** Tras el fix del heap
   (`seenInodes` solo para inodos con varios nombres), el run se plantó **16 h en la pasada rápida de
   árboles sin escribir una sola fila del CSV**, al 5 % de un núcleo y con 66 GB leídos del disco.

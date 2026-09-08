@@ -22,6 +22,7 @@ type Config struct {
 	DryRun        bool
 	Headless      bool
 	NoInteractive bool
+	ScanStore     string
 	Trash         bool
 	RemoveByGlob  string
 	Progress      bool
@@ -131,6 +132,8 @@ func init() {
 		"move duplicates to the freedesktop trash of their own filesystem instead of unlinking (reversible)")
 	f.StringVar(&cfg.RemoveByGlob, "remove-by-glob", "",
 		"headless: delete the copies whose path matches this glob (e.g. '*/tmp/photorec_*'), always keeping ≥1 copy outside the glob ('*' spans '/')")
+	f.StringVar(&cfg.ScanStore, "scan-store", "",
+		"keep the file inventory at this path and reuse it on the next run instead of walking the tree again")
 	f.BoolVar(&cfg.Progress, "progress", false,
 		"show progress during scan")
 	f.StringArrayVar(&cfg.Excludes, "exclude", nil,
@@ -392,10 +395,34 @@ func run(cmd *cobra.Command, args []string) error {
 		storeDir = os.TempDir()
 	}
 	storePath := filepath.Join(storeDir, fmt.Sprintf("dup-detector-scan-%d.db", os.Getpid()))
-	CleanStaleStores(storeDir) // sweep DBs orphaned by earlier killed runs
-	store, err := NewFileStore(storePath)
-	if err != nil {
-		return fmt.Errorf("creating scan store: %w", err)
+	if cfg.ScanStore != "" {
+		storePath = cfg.ScanStore
+	}
+	CleanStaleStores(storeDir, storePath) // sweep DBs orphaned by earlier killed runs
+
+	var store *FileStore
+	inventoryReused := false
+	if cfg.ScanStore != "" {
+		if _, serr := os.Stat(storePath); serr == nil {
+			// Un inventario viejo nombra ficheros que pueden haber cambiado de
+			// sitio o desaparecido: vale para informar, jamas para decidir un
+			// borrado. Se rechaza antes de abrirlo.
+			if !cfg.NoInteractive && !cfg.DryRun {
+				return fmt.Errorf("--scan-store reuses an inventory taken earlier, so it only reports: add --no-interactive or --dry-run")
+			}
+			store, err = OpenFileStore(storePath)
+			if err != nil {
+				return err
+			}
+			inventoryReused = true
+		}
+	}
+	if store == nil {
+		store, err = NewFileStore(storePath)
+		if err != nil {
+			return fmt.Errorf("creating scan store: %w", err)
+		}
+		store.keep = cfg.ScanStore != ""
 	}
 	defer store.Close()
 
@@ -417,26 +444,34 @@ func run(cmd *cobra.Command, args []string) error {
 		status("  [%d] %s\n", i, r)
 	}
 
-	counts := make([]int, len(roots))
-	for i, r := range roots {
-		idx := i // capture for the closure
-		status("Scanning %s ...\n", r)
-		if err := ScanToStore(store, r, &cfg, rootExcludes[idx], seenInodes, idx,
-			func(ScannedFile) { counts[idx]++ }); err != nil {
-			return fmt.Errorf("scanning %s: %w", r, err)
+	if inventoryReused {
+		n, cerr := store.Count()
+		if cerr != nil {
+			return fmt.Errorf("reading inventory %s: %w", storePath, cerr)
 		}
-	}
-	var totalFiles int
-	for i, n := range counts {
-		totalFiles += n
-		if len(roots) > 1 {
-			status("  [%d] %s: %d file(s)\n", i, roots[i], n)
+		status("Reusing the inventory at %s: %d file(s), tree not walked again\n", storePath, n)
+	} else {
+		counts := make([]int, len(roots))
+		for i, r := range roots {
+			idx := i // capture for the closure
+			status("Scanning %s ...\n", r)
+			if err := ScanToStore(store, r, &cfg, rootExcludes[idx], seenInodes, idx,
+				func(ScannedFile) { counts[idx]++ }); err != nil {
+				return fmt.Errorf("scanning %s: %w", r, err)
+			}
 		}
-	}
-	status("Found %d file(s) total\n", totalFiles)
+		var totalFiles int
+		for i, n := range counts {
+			totalFiles += n
+			if len(roots) > 1 {
+				status("  [%d] %s: %d file(s)\n", i, roots[i], n)
+			}
+		}
+		status("Found %d file(s) total\n", totalFiles)
 
-	if err := store.Finalize(); err != nil {
-		return fmt.Errorf("indexing scan store: %w", err)
+		if err := store.Finalize(); err != nil {
+			return fmt.Errorf("indexing scan store: %w", err)
+		}
 	}
 
 	// Files-under-dir resolver backed by the store (indexed prefix range).
