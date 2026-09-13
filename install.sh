@@ -18,12 +18,18 @@ fi
 
 export CGO_ENABLED=1
 
-echo "Building dup-detector (CGo / C-SQLite)..."
-go install .
-
 dest="$(go env GOBIN)"
 [ -n "$dest" ] || dest="$(go env GOPATH)/bin"
 installed="${dest}/dup-detector"
+mkdir -p "$dest"
+
+# Build next to the file the install path really points to, then rename over it.
+# Writing into the running binary fails with "text file busy" (a scan can run
+# for days); a rename swaps the file while the running process keeps the old one.
+target="$(readlink -f "$installed")"
+echo "Building dup-detector (CGo / C-SQLite)..."
+go build -o "${target}.new.$$" .
+mv -f "${target}.new.$$" "$target"
 echo "Installed: ${installed}"
 
 # go install writes to GOBIN/GOPATH-bin, which may NOT be the dup-detector that

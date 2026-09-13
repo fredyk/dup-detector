@@ -46,6 +46,14 @@ duplicados reales del usuario). Se insertan como la PRIMERA regla de filtro, as�
 ---
 
 ## ✅ HECHO
+- [x] **#25 (`--exclude` con barra + instalar con un run vivo)** `--exclude=prvt/informe.csv` no excluía
+  `home/fred/prvt/informe.csv`: un patrón con barra se comparaba contra la ruta relativa ENTERA, y en rsync
+  un patrón sin `/` inicial casa con el FINAL. Ahora `matches` prueba cada sufijo en frontera de componente;
+  y `a/**/c.csv` casa con `a/b/c.csv` (el `**` tras una parte fija no consumía componentes). TDD
+  `filter_test.go`. **`install.sh`** fallaba con *text file busy* mientras un escaneo de días usaba el
+  binario (`go install` copia encima cuando el build y GOBIN están en discos distintos): ahora compila junto
+  al destino real del enlace y hace `mv` atómico. TDD `install_test.sh` (binario ocupado tras un enlace, en
+  el FS del repo); intervención hecha: con el `go install` viejo cae con el mismo error.
 - [x] **#24 (`--scan-store`: el inventario deja de tirarse a la basura)** El recorrido de `/tank` (18 M
   ficheros) cuesta **15 h**, y hasta ahora el `FileStore` era un scratch que `Close()` borraba: cualquier
   cambio de flags, cualquier parada, obligaba a pagarlas otra vez. **`--scan-store PATH`** guarda ahí el
