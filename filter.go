@@ -41,10 +41,19 @@ func (r FilterRule) matches(relPath string) bool {
 		return m
 	}
 
-	// Pattern contains / → match against full relative path
+	// Pattern contains / but no leading / → rsync matches it against the END of
+	// the path, so try every suffix that starts at a component boundary.
 	if strings.Contains(pattern, "/") {
-		m, _ := globMatch(pattern, relPath)
-		return m
+		for suffix := relPath; ; {
+			if m, _ := globMatch(pattern, suffix); m {
+				return true
+			}
+			i := strings.Index(suffix, "/")
+			if i < 0 {
+				return false
+			}
+			suffix = suffix[i+1:]
+		}
 	}
 
 	// No slash → match against each path component (and full path for dirs)
@@ -90,11 +99,11 @@ func matchDoubleStar(pattern, name string) bool {
 				return false
 			}
 		}
-		remaining := strings.Join(nameParts[len(beforeParts):], "/")
 		if after == "" {
 			return true
 		}
-		return matchDoubleStar(after, remaining)
+		// ** consumes any number of components between before and after.
+		nameParts = nameParts[len(beforeParts):]
 	}
 
 	// No before: ** matches any prefix
